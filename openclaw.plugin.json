@@ -1,0 +1,67 @@
+{
+  "id": "auto-claude-code",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "stateDir": {
+        "type": "string",
+        "description": "Directory for plugin state. Default: ~/.state/auto_claude_code"
+      },
+      "defaultCwd": {
+        "type": "string",
+        "description": "Default cwd for launched workers when --cwd is not given. Useful for Feishu/chat invocations where ctx.cwd is unavailable."
+      },
+      "defaultModel": {
+        "type": "string",
+        "description": "Default model to pass as --model to claude at launch time."
+      },
+      "tmuxName": {
+        "type": "string",
+        "description": "Fixed tmux session name reused across launches. Default: auto-claude-worker"
+      },
+      "force": {
+        "type": "boolean",
+        "description": "If true, the watchdog auto-pastes 'keep working' into the worker whenever claude ends a turn mid-task. Default: false."
+      },
+      "maxAutoContinues": {
+        "type": "number",
+        "description": "Circuit-breaker: stop force-continuing after this many consecutive pokes without any todo progress. Default: 5."
+      },
+      "instant": {
+        "type": "boolean",
+        "description": "Delivery mode. true (default): stream raw events live via a watcher process (no cron). false: legacy cron + LLM-summary path. Override per launch with --instant / --summary."
+      },
+      "sticky": {
+        "type": "boolean",
+        "description": "If true (default), after /acc launch any plain message from that same chat is auto-forwarded into the worker — no /acc prefix needed. Set false to disable."
+      },
+      "every": {
+        "type": "string",
+        "description": "Watchdog tick interval — e.g. '5m', '30s', '2h', or a raw cron. Default: 5m"
+      },
+      "interval": {
+        "type": "string",
+        "description": "[deprecated] alias for 'every'. Still accepts a cron expression."
+      },
+      "nudgeAfterSec": {
+        "type": "number",
+        "description": "Session-jsonl staleness (seconds) before a gentle nudge. Default: 600"
+      },
+      "recoverAfterSec": {
+        "type": "number",
+        "description": "Session-jsonl staleness (seconds) before a recovery poke. Default: 1800"
+      },
+      "notify": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": { "type": "string" },
+          "to": { "type": "string" },
+          "account": { "type": "string" }
+        }
+      }
+    }
+  }
+}

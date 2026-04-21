@@ -1,0 +1,14 @@
+{
+  "name": "auto-claude-code-openclaw-plugin",
+  "version": "0.1.0",
+  "description": "Launch a persistent Claude Code worker in tmux and watchdog it via openclaw cron",
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "src", "bin", "skills", "openclaw.plugin.json"],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}
