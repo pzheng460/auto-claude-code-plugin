@@ -125,6 +125,13 @@ export async function sendEnter(name, opts) {
   await runTmux(["send-keys", "-t", name, "Enter"], opts);
 }
 
+// Send a named key (tmux's key vocabulary: Right/Left/Up/Down/Tab/Escape/
+// BSpace/etc.) to a pane. Used by form-answering logic to drive multi-step
+// TUI forms without typing literal characters.
+export async function sendKey(name, key, opts) {
+  await runTmux(["send-keys", "-t", name, key], opts);
+}
+
 export async function sendLiteral(name, text, opts) {
   await runTmux(["send-keys", "-t", name, "-l", "--", text], opts);
 }

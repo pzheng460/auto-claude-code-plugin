@@ -1,5 +1,5 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { cmdLaunch, cmdStop, cmdStatus, cmdAttach, cmdSend } from "./src/commands.js";
+import { cmdLaunch, cmdStop, cmdStatus, cmdAttach, cmdSend, cmdForm } from "./src/commands.js";
 import { loadState, resolveStateDir } from "./src/state.js";
 
 const VALUE_FLAGS = new Set(["--cwd", "--model", "--every", "--interval", "--resume", "--max-continues"]);
@@ -161,6 +161,12 @@ export default definePluginEntry({
           }
           case "send": {
             const r = await cmdSend({ pluginConfig, message: subArgs });
+            return { text: r.text };
+          }
+          case "form": {
+            // /acc form 1,2,"hello",skip,submit
+            // subArgs is everything after "form " (the csv).
+            const r = await cmdForm({ pluginConfig, csv: subArgs });
             return { text: r.text };
           }
           case "help":

@@ -20,8 +20,14 @@ import {
   killSession as tmuxKillSession,
   paneCurrentCommand,
   ensurePaneAtShell,
+  capturePane,
+  sendEnter,
+  sendLiteral,
+  sendKey,
   DEFAULT_TMUX_NAME,
 } from "./tmux.js";
+import { modalSignature } from "./tui.js";
+import { sleep } from "./util.js";
 import { pokeTmuxWorker } from "./poke.js";
 import { oneLine } from "./util.js";
 
@@ -440,6 +446,19 @@ export async function cmdSend({ pluginConfig = {}, message } = {}) {
   const text = (message ?? "").trim();
   if (!text) return { ok: false, text: "usage: /auto-claude-code <message to running worker>" };
 
+  // Auto-detect "form CSV" payload: a single digit like `1`, or a CSV of
+  // digits / skip / submit / quoted text like `1,2,"stuff",submit`. Those
+  // reply patterns target form/modal UI, so route them through cmdForm
+  // (which drives tmux with per-answer navigation) instead of a plain
+  // paste. Plain prose messages fall through to the normal send.
+  // Multi-tab form answers (with commas) go through cmdForm so we do the
+  // per-tab paste + Right navigation. A single-answer reply like `/acc 1`
+  // stays with the normal paste + Enter path — that's what a single modal
+  // expects and matches what a user would type by hand.
+  if (text.includes(",") && looksLikeFormAnswer(text)) {
+    return cmdForm({ pluginConfig, csv: text });
+  }
+
   const fallbackTmux = pluginConfig.tmuxName || DEFAULT_TMUX_NAME;
   const ctx = buildCtx(pluginConfig);
   const st = loadState(ctx.stateDir);
@@ -461,4 +480,194 @@ export async function cmdSend({ pluginConfig = {}, message } = {}) {
     ok: true,
     text: `sent to tmux '${tmuxName}': ${summarizeTask(text)}`,
   };
+}
+
+// Decide whether `text` is a form-answer-style payload (digit / CSV of
+// digits+skip+submit+quoted-text) rather than a regular prose message.
+// Conservative by design — prose like "hello, world" must NOT route to
+// cmdForm (that would reject with a validation error and confuse the user).
+// We require every comma-separated slot to be a form token; anything else
+// falls through to normal send.
+function looksLikeFormAnswer(text) {
+  const t = text.trim();
+  if (!t) return false;
+  const tokens = splitFormCsv(t);
+  if (tokens.length === 0) return false;
+  return tokens.every((tok) => {
+    if (tok.empty) return false;
+    if (tok.quoted) return true;
+    return /^(\d{1,2}|skip|submit)$/i.test(tok.text);
+  });
+}
+
+// Fill a Claude Code multi-step form by pasting each answer and navigating
+// with ← / → / Enter keys. Also drives single-question modals — `/acc 1`
+// auto-routes here as a 1-element CSV.
+//
+// CSV token grammar (one per tab, in tab order):
+//   \d{1,2}        — press that digit (select a numbered option)
+//   skip           — leave the tab's current state untouched
+//   submit         — press Enter and stop (optional — see below)
+//   "quoted text"  — paste the text literally (free-text tabs)
+//
+// Unquoted non-digit words are rejected so typos don't silently get typed
+// into a numbered-option tab. Malformed input returns a usage error so the
+// user can retype rather than trash their form.
+//
+// After the last answer we auto-press Enter, so `submit` is optional —
+// `/acc form 1,2,3,4` == `/acc form 1,2,3,4,submit`.
+//
+// Auto-advance: Claude Code's TUI select-and-advances on a digit press. If
+// we always sent Right after every paste we'd skip the next tab. So after
+// each non-last paste we compare the modal body signature before vs. after
+// the keypress; only when it DIDN'T change do we send Right ourselves.
+export async function cmdForm({ pluginConfig = {}, csv } = {}) {
+  const raw = (csv ?? "").trim();
+  if (!raw) {
+    return { ok: false, text: "usage: /acc form 1,2,\"text\",skip,submit" };
+  }
+  const ctx = buildCtx(pluginConfig);
+  const st = loadState(ctx.stateDir);
+  const tmuxName = st.workerTmuxName || pluginConfig.tmuxName || DEFAULT_TMUX_NAME;
+  if (!(await tmuxHasSession(tmuxName))) {
+    return { ok: false, text: `no tmux session '${tmuxName}' to drive` };
+  }
+
+  const parsed = parseAndValidateFormAnswers(raw);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      text: [
+        `form: ${parsed.error}`,
+        `expected CSV of: digit (e.g. 1), skip, submit, or "quoted text"`,
+        `example: /acc 1,2,"my-repo",submit`,
+        `got: ${raw}`,
+      ].join("\n"),
+    };
+  }
+  const answers = parsed.answers;
+
+  const log = [];
+  let preSig = await paneSig(tmuxName);
+  for (let i = 0; i < answers.length; i++) {
+    const a = answers[i];
+    const isLast = i === answers.length - 1;
+    try {
+      if (a.kind === "skip") {
+        log.push(`skip`);
+      } else if (a.kind === "submit") {
+        await sendEnter(tmuxName);
+        log.push(`submit`);
+        break;
+      } else if (a.kind === "digit") {
+        await sendLiteral(tmuxName, a.value);
+        log.push(`digit ${a.value}`);
+      } else {
+        await sendLiteral(tmuxName, a.value);
+        log.push(`text "${a.value}"`);
+      }
+      await sleep(300);
+
+      if (isLast) {
+        await sendEnter(tmuxName);
+        log.push("auto-Enter");
+        break;
+      }
+
+      // Did the TUI auto-advance on the keypress? Compare modal body
+      // signatures: same sig ⇒ still on the same tab ⇒ we send Right;
+      // different sig ⇒ TUI already moved ⇒ skip Right to avoid
+      // double-advancing past the next tab.
+      const postSig = await paneSig(tmuxName);
+      const advanced = postSig && preSig && postSig !== preSig;
+      if (advanced) {
+        log.push(`auto-advanced`);
+      } else {
+        await sendKey(tmuxName, "Right");
+        await sleep(250);
+      }
+      preSig = await paneSig(tmuxName);
+    } catch (err) {
+      log.push(`err on item ${i + 1} (${a.kind}:${a.value}): ${err?.message || err}`);
+      return { ok: false, text: `form drive failed at step ${i + 1}: ${err?.message || err}\nsteps: ${log.join(" → ")}` };
+    }
+  }
+  return { ok: true, text: `form filled: ${log.join(" → ")}` };
+}
+
+// Snapshot the current modal body signature. Empty string when no modal
+// is visible or tmux capture fails.
+async function paneSig(tmuxName) {
+  try {
+    const pane = await capturePane(tmuxName, { lines: 40 });
+    return modalSignature(pane);
+  } catch {
+    return "";
+  }
+}
+
+// Parse a CSV of form answers and validate every token. Returns
+//   { ok: true,  answers: [{ kind: "digit"|"text"|"skip"|"submit", value }] }
+// or an explanatory error so the caller can tell the user what's wrong and
+// prompt them to re-enter instead of pasting garbage into the TUI.
+function parseAndValidateFormAnswers(input) {
+  const tokens = splitFormCsv(input);
+  if (tokens.length === 0) return { ok: false, error: "parsed 0 answers from CSV" };
+  const answers = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok.empty) {
+      return { ok: false, error: `empty slot at position ${i + 1} (did you mean skip?)` };
+    }
+    if (tok.quoted) {
+      answers.push({ kind: "text", value: tok.text });
+      continue;
+    }
+    const t = tok.text;
+    if (/^\d{1,2}$/.test(t)) {
+      answers.push({ kind: "digit", value: t });
+    } else if (/^skip$/i.test(t)) {
+      answers.push({ kind: "skip", value: "" });
+    } else if (/^submit$/i.test(t)) {
+      answers.push({ kind: "submit", value: "" });
+    } else {
+      return {
+        ok: false,
+        error: `invalid token '${t}' at position ${i + 1}; wrap free text in "quotes" or use digit/skip/submit`,
+      };
+    }
+  }
+  return { ok: true, answers };
+}
+
+// CSV splitter that preserves quote context:
+//   { text, quoted, empty }
+// `quoted` = the token was wrapped in double quotes (so `""` is kept as an
+// empty quoted string, distinct from a missing slot).
+// `empty`  = the slot had no content at all — the middle of `1,,2`.
+function splitFormCsv(input) {
+  const out = [];
+  let buf = "";
+  let inQuotes = false;
+  let wasQuoted = false;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (inQuotes) {
+      if (c === '"') { inQuotes = false; continue; }
+      buf += c;
+      continue;
+    }
+    if (c === '"') { inQuotes = true; wasQuoted = true; continue; }
+    if (c === ",") {
+      const trimmed = buf.trim();
+      out.push({ text: trimmed, quoted: wasQuoted, empty: !wasQuoted && trimmed === "" });
+      buf = "";
+      wasQuoted = false;
+      continue;
+    }
+    buf += c;
+  }
+  const trimmed = buf.trim();
+  out.push({ text: trimmed, quoted: wasQuoted, empty: !wasQuoted && trimmed === "" });
+  return out;
 }
