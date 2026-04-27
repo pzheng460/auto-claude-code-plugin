@@ -33,7 +33,9 @@ import {
   startHookServer,
   queueForceContinue,
   pendingCount as askPendingCount,
+  deliverAnswer,
 } from "../src/hook_server.js";
+import { autoAnswerInForceMode } from "../src/auto_answer.js";
 
 const execFile = promisify(execFileCb);
 
@@ -272,6 +274,9 @@ const hookServer = startHookServer({
       return { decision: "block", reason: "auto-continue queued by force mode" };
     },
     // Push a question (from acc_ask_user MCP tool) into the user's chat.
+    // In force mode, also fire a sub-agent to auto-answer in parallel —
+    // whichever returns first (chat reply or sub-agent) wins via
+    // deliverAnswer's first-resolver-wins semantics.
     pushQuestion: async ({ id, questions }) => {
       const lines = [
         `🗂 Claude is asking ${questions.length} question${questions.length > 1 ? "s" : ""} (#${id.slice(0, 8)}):`,
@@ -292,7 +297,27 @@ const hookServer = startHookServer({
         "For multi-select, use space inside a slot e.g. `/acc 1, \"1 3\", 2`. " +
         "For free text, use quotes: `/acc 1, \"my-repo\", 3`."
       );
+      if (FORCE_MODE) {
+        lines.push("", "⚙️ Force mode: a sub-agent will auto-answer if you don't reply first.");
+      }
       await pushToChannel(lines.join("\n"));
+
+      if (FORCE_MODE) {
+        const fresh = loadState(stateDir);
+        autoAnswerInForceMode({ task: fresh.workerTask || "", questions })
+          .then(async (answer) => {
+            const delivered = deliverAnswer(answer);
+            if (delivered) {
+              log(`[auto-answer] resolved acc_ask_user #${id.slice(0, 8)}: ${oneLine(answer)}`);
+              await pushToChannel(`🤖 auto-answered #${id.slice(0, 8)}: \`${oneLine(answer)}\``);
+            } else {
+              log(`[auto-answer] late for #${id.slice(0, 8)} — user already answered`);
+            }
+          })
+          .catch((err) => {
+            log(`[auto-answer] failed for #${id.slice(0, 8)}:`, err?.stderr?.toString?.() || err?.message || err);
+          });
+      }
     },
   },
 });
