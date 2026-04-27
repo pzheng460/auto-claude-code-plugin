@@ -20,10 +20,8 @@ import {
 } from "../src/claude-state.js";
 import {
   hasSession as tmuxHasSession,
-  capturePane,
   sendLiteral,
   sendEnter,
-  sendKey,
 } from "../src/tmux.js";
 import { retireReasonFor } from "../src/tick/plan.js";
 import { buildContinuePrompt, pokeTmuxWorker } from "../src/poke.js";
@@ -31,7 +29,11 @@ import { removeCronJob } from "../src/cron.js";
 import { envNum, envBool } from "../src/env.js";
 import { sleep, oneLine } from "../src/util.js";
 import { formatAssistantText } from "../src/watcher-format.js";
-import { detectMultiStepForm, extractModalBlock } from "../src/tui.js";
+import {
+  startHookServer,
+  queueForceContinue,
+  pendingCount as askPendingCount,
+} from "../src/hook_server.js";
 
 const execFile = promisify(execFileCb);
 
@@ -140,310 +142,6 @@ function analyzeChunk(events) {
   return { awaitingReason: awaitingReason, hadToolUse };
 }
 
-// Detect the "sensitive file" permission modal Claude Code shows when a
-// tool tries to edit paths under ~/.claude — even with
-// --dangerously-skip-permissions. Signature: a "Do you want to …?"
-// question + "2. Yes, and …" option + "3. No" option. Narrow enough to
-// not misfire on ordinary output.
-function detectSensitivePrompt(paneText) {
-  if (!paneText) return false;
-  if (!/Do you want to/.test(paneText)) return false;
-  if (!/^\s*2\.\s*Yes,\s*and\b/m.test(paneText)) return false;
-  if (!/^\s*3\.\s*No\b/m.test(paneText)) return false;
-  return true;
-}
-
-// Broader detector: any Claude Code modal with a question + at least two
-// numbered options at the tail of the pane. Covers plan-approval prompts,
-// MCP trust dialogs, custom tool confirmations, etc. The user can answer
-// these by replying `/acc <digit>` — cmdSend routes it via tmux paste and
-// the TUI picks that option.
-function detectGenericModal(paneText) {
-  if (!paneText) return false;
-  // ❯ 1. <...> plus a 2. <...> line in the tail is a strong signature.
-  if (!/^\s*❯?\s*1\.\s+\S/m.test(paneText)) return false;
-  if (!/^\s*2\.\s+\S/m.test(paneText)) return false;
-  return true;
-}
-
-// detectMultiStepForm + extractModalBlock moved to src/tui.js so cmdForm
-// can share the same parsing (for auto-advance detection).
-
-async function pressModalChoice(tmuxName, digit) {
-  // Literal digit keypress, short pause, then Enter — same sequence a user
-  // would produce from `tmux attach`.
-  await sendLiteral(tmuxName, String(digit));
-  await sleep(200);
-  await sendEnter(tmuxName);
-}
-
-// Ask openclaw's default agent (`openclaw agent --agent main --json`) a one-shot
-// question. Returns the raw text the agent replied with, or null on failure.
-// Used by force-mode form auto-fill to pick answers for each tab.
-async function askAgentOnce(prompt, { timeoutMs = 60000 } = {}) {
-  try {
-    const { stdout } = await execFile(
-      "openclaw",
-      ["agent", "--json", "--agent", "main", "--message", prompt],
-      { encoding: "utf8", maxBuffer: 2 * 1024 * 1024, timeout: timeoutMs },
-    );
-    const parsed = JSON.parse(stdout);
-    const text = parsed?.result?.payloads?.[0]?.text;
-    return typeof text === "string" ? text.trim() : null;
-  } catch (err) {
-    log("askAgentOnce error:", err?.message || err);
-    return null;
-  }
-}
-
-// Interpret LLM reply as one of: { kind: "digit", value } | { kind: "text", value }
-// | { kind: "skip" }. Defensive against common LLM output noise (quotes,
-// code fences, "Option 1:" prefixes, trailing punctuation).
-function parseAgentAnswer(raw) {
-  if (!raw) return { kind: "skip" };
-  let s = String(raw).trim();
-  // strip code fences
-  s = s.replace(/^```[a-z]*\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-  // strip quotes
-  s = s.replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
-  // If starts with a digit, treat as numeric choice (tolerate "1.", "1)", "1,").
-  const m = s.match(/^(\d{1,2})(?=\D|$)/);
-  if (m) return { kind: "digit", value: m[1] };
-  if (/^skip$/i.test(s)) return { kind: "skip" };
-  // Text input. Cap length so runaway LLM responses can't clobber the TUI.
-  return { kind: "text", value: s.slice(0, 80) };
-}
-
-// Drive a multi-step form end-to-end with a single-shot LLM call:
-//   Phase 1: walk Right through all tabs, capturing each tab's body
-//   Phase 2: walk Left back to tab 0
-//   Phase 3: ask LLM once with recent jsonl context + every tab's question
-//            to return a CSV answer per tab
-//   Phase 4: apply answers sequentially (paste + Right; Enter on Submit)
-// Walking first means LLM sees every tab's actual options (not just labels)
-// and can pick consistent answers across tabs; jsonl context lets it infer
-// user preferences from the ongoing conversation.
-// Walk through every tab of a multi-step form with Right arrows, capturing
-// each tab's rendered body from capture-pane, then navigate back to tab 0
-// with Left arrows. Returns an array of { idx, label, body }. Used by both
-// force-mode auto-fill (to feed the LLM all tab content at once) and
-// non-force-mode surfacing (to show the user every question up front so
-// they can answer with a single /acc form CSV).
-async function collectFormTabs(tmuxName, tabs) {
-  log(`[form] walk ${tabs.length} tabs: ${tabs.map((t) => t.label).join(" / ")}`);
-  const captured = [];
-  for (let i = 0; i < tabs.length; i++) {
-    await sleep(500);
-    const pane = await capturePane(tmuxName, { lines: 40 }).catch(() => "");
-    const body = extractModalBlock(pane) || "";
-    log(`[form] tab ${i + 1}/${tabs.length} "${tabs[i].label}" captured ${body.length} chars`);
-    captured.push({ idx: i, label: tabs[i].label, body });
-    if (i < tabs.length - 1) {
-      await sendKey(tmuxName, "Right");
-    }
-  }
-  log(`[form] walk done, sending ${tabs.length - 1}× Left to return to tab 0`);
-  for (let i = 0; i < tabs.length - 1; i++) {
-    await sendKey(tmuxName, "Left");
-    await sleep(150);
-  }
-  await sleep(400);
-  // Safety: if the form disappeared during the walk (Claude Code's TUI
-  // sometimes interprets stray arrow input as cancel), bail out early
-  // before we send more keystrokes into an unknown state.
-  const probe = await capturePane(tmuxName, { lines: 40 }).catch(() => "");
-  if (!detectMultiStepForm(probe)) {
-    throw new Error("form vanished during walk (TUI may have treated Right/Left as cancel)");
-  }
-  return captured;
-}
-
-async function autoFillForm(tmuxName, formInfo, workerTask, jsonlPath) {
-  const tabs = formInfo.tabs;
-  if (tabs.length === 0) return ["(empty form)"];
-
-  // Phase 1+2 — walk all tabs + capture each body + return to tab 0.
-  const captured = await collectFormTabs(tmuxName, tabs);
-
-  // Phase 3 — build batch prompt with full jsonl context.
-  const recent = jsonlPath
-    ? summarizeRecentOutput(jsonlPath, { maxEvents: 18, textCharLimit: 260 })
-    : { lines: [] };
-  const recentLines = (recent?.lines || []).slice(-18);
-  const prompt = [
-    "You are auto-filling a multi-tab TUI form on behalf of a Claude Code worker.",
-    "",
-    `Worker's original task: "${workerTask || "(unknown)"}"`,
-    "",
-    "Recent session activity (most recent last) — use it to infer user's preferences:",
-    "```",
-    recentLines.length ? recentLines.join("\n") : "(no recent activity)",
-    "```",
-    "",
-    `The form has ${tabs.length} tabs. Here's each tab's rendered body:`,
-    "",
-    ...captured.map((c) => `=== Tab ${c.idx + 1}: ${c.label} ===\n${c.body || "(no body captured — likely a Submit/confirm button)"}\n`),
-    "",
-    `Respond with a CSV of exactly ${tabs.length} items, one per tab IN ORDER.`,
-    "Each item must be one of:",
-    "  • a digit 1-9  — pick that numbered option",
-    "  • short text (<=60 chars, no quotes) — type as-is into a text-input tab",
-    "  • skip         — leave at default, advance",
-    "  • submit       — for the final Submit tab (presses Enter)",
-    "",
-    "Example (5-tab repo-setup form):",
-    "  2, MIT, auto-claude-code plugin, cli claude-code agent, submit",
-    "",
-    "Output ONLY the CSV line. No preamble, no markdown, no explanation.",
-  ].join("\n");
-
-  log(`[form] prompt built (${prompt.length} chars), calling LLM`);
-  const raw = (await askAgentOnce(prompt, { timeoutMs: 90000 })) || "";
-  log(`[form] LLM raw: ${raw.replace(/\n/g, "⏎").slice(0, 300)}`);
-  const answers = parseBatchCsv(raw, tabs.length);
-  if (!answers || answers.length === 0) {
-    throw new Error(`LLM returned unparseable CSV: ${raw.slice(0, 200)}`);
-  }
-  log(`[form] parsed answers: ${JSON.stringify(answers)}`);
-
-  // Phase 4 — apply. After each numeric keypress, we re-capture the pane
-  // to see if Claude's TUI auto-advanced on its own (many numbered-option
-  // TUIs do select+advance on a digit press). Only send Right when we're
-  // still on the current tab — otherwise we'd skip the next tab entirely.
-  const steps = [];
-  let currentTabIdx = 0;
-  for (let i = 0; i < tabs.length; i++) {
-    const tab = tabs[i];
-    const a = (answers[i] ?? "").trim();
-    const isLast = i === tabs.length - 1;
-    const wantsSubmit = /^submit$/i.test(a) || (isLast && /submit|confirm|done|finish/i.test(tab.label));
-    log(`[form] applying tab ${i + 1}/${tabs.length} "${tab.label}" ← "${a}" (wantsSubmit=${wantsSubmit})`);
-    if (wantsSubmit) {
-      await sendEnter(tmuxName);
-      steps.push(`${tab.label} → Enter`);
-      break;
-    }
-    if (!a || /^skip$/i.test(a)) {
-      steps.push(`${tab.label} → skip`);
-    } else if (/^\d{1,2}$/.test(a)) {
-      await sendLiteral(tmuxName, a);
-      steps.push(`${tab.label} → ${a}`);
-    } else {
-      const text = a.replace(/^["']|["']$/g, "");
-      await sendLiteral(tmuxName, text);
-      steps.push(`${tab.label} → "${text}"`);
-    }
-    await sleep(400);
-    if (isLast) {
-      // End of sequence without explicit submit. Press Enter to confirm —
-      // safe no-op if claude already auto-submitted on the last digit,
-      // and triggers Submit otherwise.
-      await sendEnter(tmuxName);
-      steps.push("auto-Enter");
-      break;
-    }
-    // Inspect pane: did the keypress auto-advance? If the current tab
-    // body still looks like this tab's captured body, we're still here
-    // and need to send Right. If the body already matches the NEXT
-    // tab's captured body, the TUI advanced on its own — skip Right.
-    const postPane = await capturePane(tmuxName, { lines: 40 }).catch(() => "");
-    const postBody = extractModalBlock(postPane) || "";
-    const advanced = postBody && captured[i + 1]?.body &&
-      postBody.slice(0, 60) === captured[i + 1].body.slice(0, 60);
-    log(`[form] post-apply pane: ${postBody.slice(0, 60).replace(/\n/g, "⏎")} (advanced=${advanced})`);
-    if (!advanced) {
-      await sendKey(tmuxName, "Right");
-      await sleep(600);
-    }
-  }
-  return steps;
-}
-
-// Parse an LLM CSV reply tolerantly: strips code fences, picks the first
-// line with commas, honors double-quoted tokens with commas inside, pads
-// with "skip" if short, truncates if long. Returns an array of length
-// `expected`.
-function parseBatchCsv(raw, expected) {
-  if (!raw) return null;
-  let s = String(raw).trim();
-  s = s.replace(/^```[a-z]*\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-  const lines = s.split(/\n/).map((l) => l.trim()).filter(Boolean);
-  const picked = lines.find((l) => l.includes(",")) || lines[0] || "";
-  const out = [];
-  let buf = "";
-  let inQ = false;
-  for (const c of picked) {
-    if (inQ) {
-      if (c === '"') inQ = false;
-      else buf += c;
-      continue;
-    }
-    if (c === '"') { inQ = true; continue; }
-    if (c === ",") { out.push(buf.trim()); buf = ""; continue; }
-    buf += c;
-  }
-  if (buf.trim()) out.push(buf.trim());
-  while (out.length < expected) out.push("skip");
-  return out.slice(0, expected);
-}
-
-// Old per-tab driver kept around (unused) in case we want to A/B it later.
-async function autoFillForm_OLD_PER_TAB(tmuxName, formInfo, workerTask) {
-  const steps = [];
-  const tabs = formInfo.tabs;
-  for (let i = 0; i < tabs.length; i++) {
-    const tab = tabs[i];
-    const isLast = i === tabs.length - 1;
-    const looksLikeSubmit = /submit|confirm|done|finish/i.test(tab.label);
-    if (isLast && looksLikeSubmit) {
-      await sendEnter(tmuxName);
-      steps.push(`${tab.label} → Enter (submit)`);
-      break;
-    }
-    const pane = await capturePane(tmuxName, { lines: 40 }).catch(() => "");
-    const question = extractModalBlock(pane) || "(no modal body)";
-    const prompt = [
-      "You are answering a multi-step form question that a Claude Code worker is currently stuck on.",
-      "",
-      `Worker's task: "${workerTask || "(unknown)"}"`,
-      `Form tabs (in order): ${tabs_summary(tabs)}`,
-      `Currently on tab: "${tab.label}"`,
-      "",
-      "Question and options for this tab (captured from the TUI):",
-      "```",
-      question,
-      "```",
-      "",
-      "Respond with ONLY:",
-      "  • a single digit 1-9 to pick that numbered option",
-      "  • short text (<=60 chars, no quotes/markdown) for a text-input tab",
-      "  • the word skip if the default is fine",
-      "",
-      "No explanation, no code fence, no preamble. Just the answer token.",
-    ].join("\n");
-    const reply = await askAgentOnce(prompt);
-    const answer = parseAgentAnswer(reply);
-    if (answer.kind === "skip") {
-      steps.push(`${tab.label} → skip`);
-    } else if (answer.kind === "digit") {
-      await sendLiteral(tmuxName, answer.value);
-      steps.push(`${tab.label} → ${answer.value}`);
-    } else {
-      await sendLiteral(tmuxName, answer.value);
-      steps.push(`${tab.label} → "${answer.value}"`);
-    }
-    await sleep(300);
-    await sendKey(tmuxName, "Right");
-    await sleep(700); // let the tab-switch animation / re-render settle
-  }
-  return steps;
-}
-
-function tabs_summary(tabs) {
-  return tabs.map((t, i) => `${i + 1}.${t.label}${t.done ? "✔" : ""}`).join(", ");
-}
-
-// extractModalBlock lives in src/tui.js (imported above).
 
 // Pretty-print a duration in ms as Nh Mm or Mm Ss for readability.
 function formatDuration(ms) {
@@ -540,27 +238,93 @@ async function pushToChannel(text) {
 }
 
 // -- bootstrap ---------------------------------------------------------------
-const state = loadState(stateDir);
+// Stand up the HTTP listener FIRST — claude's MCP client connects within a
+// second of REPL spawn, so binding port 7779 before claude starts is the
+// only way to avoid "1 MCP server failed". cmdLaunch spawns this watcher
+// before launchWorker for the same reason; here we make sure we don't
+// regress that by sleeping on state.workerSessionId before binding.
+//
+// Defaults to :7779 on localhost; override via AUTO_CLAUDE_CODE_HOOK_PORT.
+const hookServer = startHookServer({
+  hooks: {
+    // Stop hook: claude finished a turn. If force mode is on and we
+    // haven't hit max-continues, queue a force-continue prompt for the
+    // next UserPromptSubmit and tell claude to NOT exit.
+    onStop: async (payload) => {
+      if (!FORCE_MODE) return {};
+      // Cap on auto-continues — same circuit breaker as the existing
+      // tmux-based path. Read fresh from state because launchWorker may
+      // have reset autoContinueCount on a new task.
+      const fresh = loadState(stateDir);
+      const count = fresh.autoContinueCount || 0;
+      if (count >= MAX_CONTINUES) {
+        log(`[stop hook] hit max-continues (${count}); allowing exit`);
+        return {};
+      }
+      // Build the same continue prompt we'd otherwise paste via tmux.
+      const prompt = buildContinuePrompt({
+        purpose: fresh.workerTask || "task",
+        priorTrigger: "Stop hook detected end_turn",
+      });
+      queueForceContinue(prompt);
+      saveState(stateDir, { autoContinueCount: count + 1 });
+      log(`[stop hook] queued force-continue (count ${count + 1}/${MAX_CONTINUES})`);
+      return { decision: "block", reason: "auto-continue queued by force mode" };
+    },
+    // Push a question (from acc_ask_user MCP tool) into the user's chat.
+    pushQuestion: async ({ id, questions }) => {
+      const lines = [
+        `🗂 Claude is asking ${questions.length} question${questions.length > 1 ? "s" : ""} (#${id.slice(0, 8)}):`,
+        "",
+      ];
+      questions.forEach((q, i) => {
+        lines.push(`**${i + 1}. ${q.header || q.question}**`);
+        if (q.header && q.header !== q.question) lines.push(`> ${q.question}`);
+        if (q.multiSelect) lines.push("_(multi-select; comma-separate digits)_");
+        (q.options || []).forEach((opt, j) => {
+          const desc = opt.description ? ` — ${opt.description}` : "";
+          lines.push(`  ${j + 1}. **${opt.label}**${desc}`);
+        });
+        lines.push("");
+      });
+      lines.push(
+        "Reply: `/acc 1, 2, 3` (one digit per question, in order). " +
+        "For multi-select, use space inside a slot e.g. `/acc 1, \"1 3\", 2`. " +
+        "For free text, use quotes: `/acc 1, \"my-repo\", 3`."
+      );
+      await pushToChannel(lines.join("\n"));
+    },
+  },
+});
+log(`[hooks] HTTP listener up on http://127.0.0.1:${hookServer._listenedPort}`);
+
+// Now wait for cmdLaunch to write workerSessionId. cmdLaunch spawns the
+// watcher BEFORE launchWorker so claude finds MCP listening, which means
+// state lags us by however long it takes claude to start (typically <1s).
+const STATE_WAIT_MS = envNum("AUTO_CLAUDE_CODE_WATCHER_STATE_WAIT_MS", 15_000);
+const stateDeadline = Date.now() + STATE_WAIT_MS;
+let state = loadState(stateDir);
+while (!state.workerSessionId && Date.now() < stateDeadline) {
+  await sleep(200);
+  state = loadState(stateDir);
+}
 if (!state.workerSessionId) {
-  log("no active worker; exiting");
+  log(`no active worker after ${STATE_WAIT_MS}ms; exiting`);
   process.exit(0);
 }
 // Don't start a second watcher if one is already alive. Two watchers on the
-// same tmux would both send arrow keys and type answers, which can look
-// like cancel to Claude Code's TUI and completely derail a form.
+// same tmux would both trigger Stop hooks and queue duplicate force-continues.
 if (state.watcherPid && state.watcherPid !== process.pid) {
   try {
     process.kill(state.watcherPid, 0); // probe, doesn't signal
     log(`another watcher (pid ${state.watcherPid}) already active — exiting`);
     process.exit(0);
   } catch (err) {
-    // ESRCH = the recorded pid is dead; safe to claim the slot
     if (err?.code !== "ESRCH") {
       log(`watcher-pid probe error: ${err?.message || err}; continuing anyway`);
     }
   }
 }
-// Claim the slot early so a concurrent launch sees us.
 saveState(stateDir, { watcherPid: process.pid, watcherStartedAt: new Date().toISOString() });
 
 // Wait for the jsonl to appear — claude needs a few seconds to spin up the
@@ -576,22 +340,11 @@ let toolUseSinceLastPoke = false;
 // don't re-evaluate — the jsonl hasn't moved past our last poke, so the same
 // end_turn event is still "trailing" and would cause a redundant poke.
 let lastPokedAtOffset = -1;
-// Debounce so a single modal doesn't get answered repeatedly while Claude
-// is still tearing down the prompt after our first keypress.
-let lastAutoAnswerAt = 0;
 // Track whether we've already pushed a completion report for the current
 // DONE/BLOCKED so we don't re-spam on every poll. Resets when a user event
 // lands — a fresh user turn starts a new exchange that could end in its
 // own completion.
 let completionReported = false;
-// Dedupe for modal push: remember the exact block we last surfaced so we
-// don't repeatedly spam the same question while the user is thinking.
-// Resets when jsonl grows (meaning claude processed a reply → new state).
-let lastPushedModalBlock = null;
-// Same dedupe for multi-step form push. Stores the last tab-bar + current-
-// question text we surfaced, so a 2s poll loop doesn't re-announce the
-// same form every tick. Cleared on jsonl movement (user gave an answer).
-let lastPushedFormBlock = null;
 const APPEAR_TIMEOUT_MS = envNum("AUTO_CLAUDE_CODE_WATCHER_APPEAR_MS", 60_000);
 const appearDeadline = Date.now() + APPEAR_TIMEOUT_MS;
 while (!jsonlPath || !existsSync(jsonlPath)) {
@@ -821,164 +574,6 @@ async function loop() {
           }
         }
       }
-    }
-
-    // Modal surfacing: Claude Code pops up prompts (permission, plan
-    // approval, MCP trust, tool confirms, …) that never land in jsonl.
-    // capture-pane is the only way to see them. Policy:
-    //   • Always surface the modal text to notify so the user sees exactly
-    //     what's being asked and the available options.
-    //   • For the specific "sensitive-file" pattern in force mode, also
-    //     auto-press 2 (yes + session-allow) so force workers don't stall
-    //     on writes under ~/.claude/.
-    //   • For every other modal, don't answer — tell the user to reply
-    //     /acc <digit>, which routes through cmdSend → tmux paste.
-    // Dedupe by exact block content; reset whenever jsonl advances (claude
-    // processed a reply, so a fresh modal is worth re-surfacing).
-    if (chunk.events.length > 0) { lastPushedModalBlock = null; lastPushedFormBlock = null; }
-    try {
-      const pane = await capturePane(state.workerTmuxName, { lines: 40 }).catch(() => "");
-      const form = pane ? detectMultiStepForm(pane) : null;
-      const isSensitive = !form && pane && detectSensitivePrompt(pane);
-      const isGeneric = !form && pane && !isSensitive && detectGenericModal(pane);
-      if (form) {
-        const tabsLine = form.tabs
-          .map((t, i) => `${t.done ? "✔" : "☐"} ${i + 1}. ${t.label}`)
-          .join("  ·  ");
-        const currentBlock = extractModalBlock(pane) || "(current tab body not extractable)";
-        const formSignature = `${tabsLine}\n${currentBlock}`;
-        if (formSignature !== lastPushedFormBlock) {
-          lastPushedFormBlock = formSignature;
-          if (FORCE_MODE) {
-            // Force-mode: auto-fill each tab via LLM. Notify up front (so
-            // the user sees something is happening during the minute or so
-            // the form takes to drive) and at the end with final results.
-            await pushToChannel(
-              `🤖 force mode — auto-filling ${form.tabs.length}-tab form via LLM...\n\n**Tabs:** ${tabsLine}`,
-            );
-            appendNudge(stateDir, {
-              ts: new Date().toISOString(),
-              branch: "AWAITING",
-              ok: true,
-              reason: `force-mode form auto-fill started (${form.tabs.length} tabs)`,
-            });
-            try {
-              const steps = await autoFillForm(state.workerTmuxName, form, state.workerTask || "", jsonlPath);
-              await pushToChannel(
-                `✅ form auto-filled:\n\`\`\`\n${steps.map((s) => "  · " + s).join("\n")}\n\`\`\``,
-              );
-              appendNudge(stateDir, {
-                ts: new Date().toISOString(),
-                branch: "AWAITING",
-                ok: true,
-                reason: `form auto-fill done (${steps.length} steps)`,
-              });
-            } catch (err) {
-              await pushToChannel(
-                `❌ form auto-fill errored: ${err?.message || err}\n\`tmux attach -t ${state.workerTmuxName}\` to finish manually.`,
-              );
-            }
-            // reset so a following form is re-detected fresh
-            lastPushedFormBlock = null;
-          } else {
-            appendNudge(stateDir, {
-              ts: new Date().toISOString(),
-              branch: "AWAITING",
-              ok: true,
-              reason: `multi-step form surfaced (${form.tabs.length} tabs)`,
-            });
-            // Walk all tabs to collect every question up front, then push
-            // the complete picture so the user can compose a single CSV
-            // reply. Same collection step as the force-mode autofill.
-            let captured = [];
-            try {
-              captured = await collectFormTabs(state.workerTmuxName, form.tabs);
-            } catch (err) {
-              log("form walk failed:", err?.message || err);
-            }
-            // Guard: if more than half the bodies came back empty, the form
-            // was probably in a transition state (UI hadn't fully rendered
-            // or is already being dismissed). Push a compact placeholder
-            // instead of 5 lines of "(no body captured)" noise.
-            // Skip push when we captured nothing useful — either walk
-            // threw (captured=[]) or most bodies came back empty (form
-            // transient / glyph parse off / concurrent watcher walked
-            // over us).
-            const emptyBodies = captured.filter((c) => !c.body).length;
-            const skipPush = captured.length === 0 || emptyBodies > captured.length / 2;
-            if (skipPush) {
-              log(`[form] useless capture (len=${captured.length}, empty=${emptyBodies}) — skipping push`);
-              lastPushedFormBlock = null;
-            }
-            if (!skipPush) {
-            const perTab = (captured.length
-              ? captured
-              : form.tabs.map((t, i) => ({ idx: i, label: t.label, body: "" }))
-            )
-              .map((c) => `### Tab ${c.idx + 1} · ${c.label}\n${c.body || "(no body captured)"}`)
-              .join("\n\n");
-            const msg = [
-              `🗂 Claude is showing a ${form.tabs.length}-tab form — reply \`/acc form <csv>\` to fill it in one shot.`,
-              "",
-              `**Tab bar:** ${tabsLine}`,
-              "",
-              "**All tabs' questions/options (walked once so you can see everything):**",
-              "",
-              "```",
-              perTab,
-              "```",
-              "",
-              "**CSV protocol** — one item per tab, in order:",
-              "  • digit `1` / `2` / … = pick that numbered option",
-              "  • `\"quoted text\"` = paste text (for Type-something tabs)",
-              "  • `skip` = leave tab's default, advance",
-              "  • `submit` = optional — Enter is auto-pressed at the end anyway",
-              "",
-              "Example: `/acc 2, 1, \"cool project\", \"cli, tool\"` (Enter auto)",
-            ].join("\n");
-            await pushToChannel(msg);
-            }  // close `if (!skipPush)`
-          }
-        }
-      } else if (isSensitive || isGeneric) {
-        const modalBlock = extractModalBlock(pane) || "(modal text unavailable)";
-        if (modalBlock !== lastPushedModalBlock) {
-          lastPushedModalBlock = modalBlock;
-          const autoAnswer = isSensitive && FORCE_MODE && Date.now() - lastAutoAnswerAt > 3000;
-          if (autoAnswer) {
-            log("sensitive-file modal detected; pressing 2 (force mode)");
-            await pressModalChoice(state.workerTmuxName, 2);
-            lastAutoAnswerAt = Date.now();
-            appendNudge(stateDir, {
-              ts: new Date().toISOString(),
-              branch: "AWAITING",
-              ok: true,
-              reason: "auto-approved sensitive-file prompt (choice 2)",
-            });
-          } else {
-            appendNudge(stateDir, {
-              ts: new Date().toISOString(),
-              branch: "AWAITING",
-              ok: true,
-              reason: "modal surfaced to user (awaiting reply)",
-            });
-          }
-          const header = autoAnswer
-            ? "🔐 Claude asked a permission question (auto-answered with **2** since force mode is on):"
-            : "🔐 Claude is asking — pick an option:";
-          // Footer varies with modal type:
-          //  - sensitive-file: 1/2/3 mean yes/yes+always/no (known semantics)
-          //  - generic: we can't assume 1/2/3 meanings, just show how to reply
-          const hint = autoAnswer
-            ? "→ picked option 2 (yes + session-allow). Reply `/acc <digit>` to override if needed."
-            : isSensitive
-              ? "→ reply `/acc 1` (yes), `/acc 2` (yes+always), `/acc 3` (no)"
-              : "→ reply `/acc <digit>` to pick that numbered option, or `/acc \"your text\"` to type into a text-input field.";
-          await pushToChannel([header, "", "```", modalBlock, "```", "", hint].join("\n"));
-        }
-      }
-    } catch (err) {
-      log("modal-check error:", err?.message || err);
     }
 
     tickCount++;

@@ -96,12 +96,6 @@ export async function killSession(name, opts) {
 
 // ---------- pane I/O ----------
 
-export async function capturePane(name, { lines = 0, ...rest } = {}) {
-  const args = ["capture-pane", "-t", name, "-p"];
-  if (lines > 0) args.push("-S", `-${lines}`);
-  return runTmux(args, rest);
-}
-
 // Ask tmux what foreground command is running in the pane. Returns the
 // short command name (e.g. "claude", "zsh", "bash"). This is the most
 // reliable signal we've got for "is claude still running?" — waitForShellReady
@@ -123,13 +117,6 @@ export async function paneCurrentCommand(name, opts) {
 
 export async function sendEnter(name, opts) {
   await runTmux(["send-keys", "-t", name, "Enter"], opts);
-}
-
-// Send a named key (tmux's key vocabulary: Right/Left/Up/Down/Tab/Escape/
-// BSpace/etc.) to a pane. Used by form-answering logic to drive multi-step
-// TUI forms without typing literal characters.
-export async function sendKey(name, key, opts) {
-  await runTmux(["send-keys", "-t", name, key], opts);
 }
 
 export async function sendLiteral(name, text, opts) {

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_TMUX_NAME,
@@ -103,7 +104,14 @@ export async function launchWorker({
     await sleep(300);
   }
 
-  const claudeArgs = ["--dangerously-skip-permissions"];
+  // Plugin path: this file lives at <plugin-root>/src/launch.js, so the
+  // plugin root is one dir up. Tell claude to load it via --plugin-dir
+  // so the lifecycle hooks + acc_ask_user MCP tool are available.
+  const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const claudeArgs = [
+    "--dangerously-skip-permissions",
+    "--plugin-dir", PLUGIN_ROOT,
+  ];
   if (resumeSessionId) {
     claudeArgs.push("--resume", resumeSessionId);
   } else if (continueLatest) {
@@ -116,7 +124,15 @@ export async function launchWorker({
   }
   if (model) claudeArgs.push("--model", model);
 
-  const parts = ["claude", ...claudeArgs.map(shellSafe)];
+  // Pre-pend NO_PROXY for the claude command so the bundled MCP server
+  // at http://127.0.0.1:7779/mcp isn't intercepted by the user's HTTP
+  // proxy. We OR with whatever no_proxy already is so we don't clobber
+  // existing settings.
+  const parts = [
+    "NO_PROXY=\"${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1\"",
+    "no_proxy=\"${no_proxy:+$no_proxy,}localhost,127.0.0.1\"",
+    "claude", ...claudeArgs.map(shellSafe),
+  ];
   if (task) parts.push(shellSafe(task));
   await sendLiteral(tmuxName, parts.join(" "));
   await sendEnter(tmuxName);

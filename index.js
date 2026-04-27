@@ -1,5 +1,5 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { cmdLaunch, cmdStop, cmdStatus, cmdAttach, cmdSend, cmdForm } from "./src/commands.js";
+import { cmdLaunch, cmdStop, cmdStatus, cmdAttach, cmdSend, cmdResume } from "./src/commands.js";
 import { loadState, resolveStateDir } from "./src/state.js";
 
 const VALUE_FLAGS = new Set(["--cwd", "--model", "--every", "--interval", "--resume", "--max-continues"]);
@@ -56,8 +56,10 @@ function usage() {
     "  attach              print the tmux attach command",
     "  stop [--kill-tmux]  stop watcher/cron; tmux stays unless --kill-tmux",
     "  send <text>         paste <text> into the running worker",
+    "  resume [n|sid|last] list recent sessions (no arg) or resume one",
     "  help                show this help",
-    "  <anything else>     implicit send — the message is forwarded to the worker",
+    "  <prose>             implicit send — forwarded to the worker",
+    "  <n>|<n,n,…,submit>  reply to a Claude Code modal/form (auto-routed)",
     "",
     "Launch flags",
     "  --cwd <dir>            working directory (default: config or process cwd)",
@@ -74,9 +76,12 @@ function usage() {
     "",
     "Examples",
     "  /acc launch refactor src/auth to use the new JWT helper",
-    "  /acc launch --resume-last keep going on the test failures",
+    "  /acc resume                            # list recent sessions",
+    "  /acc resume 2                          # resume the 2nd from the list",
+    "  /acc resume last keep going on tests   # resume + inject a new prompt",
     "  /acc status",
-    "  /acc how is it going?        # sticky — auto-forwards to the worker",
+    "  /acc 1                                 # answers a pending acc_ask_user question",
+    "  /acc how is it going?                  # plain prose — sticky paste",
     "  /acc stop",
   ].join("\n");
 }
@@ -163,10 +168,11 @@ export default definePluginEntry({
             const r = await cmdSend({ pluginConfig, message: subArgs });
             return { text: r.text };
           }
-          case "form": {
-            // /acc form 1,2,"hello",skip,submit
-            // subArgs is everything after "form " (the csv).
-            const r = await cmdForm({ pluginConfig, csv: subArgs });
+          case "resume": {
+            // /acc resume                — list recent sessions
+            // /acc resume <n|sid|last>   — resume that session
+            // Trailing prose is forwarded as a fresh prompt to inject.
+            const r = await cmdResume({ pluginConfig, args: subArgs });
             return { text: r.text };
           }
           case "help":
@@ -188,7 +194,7 @@ export default definePluginEntry({
     // Register both the long name and the short alias `/acc` with the same
     // handler so users can type whichever is faster.
     const cmdSpec = {
-      description: "Control an auto-claude-code tmux worker (launch|status|attach|stop|send)",
+      description: "Control an auto-claude-code tmux worker (launch|status|attach|resume|stop|send)",
       acceptsArgs: true,
       handler,
     };

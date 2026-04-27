@@ -7,7 +7,7 @@ import {
   clearWorker,
   retireWorker,
 } from "./state.js";
-import { inspectWorker, locateSessionJsonl } from "./claude-state.js";
+import { inspectWorker, locateSessionJsonl, listRecentSessions, readFirstUserMessage } from "./claude-state.js";
 import { decideBranch, formatStatusLine } from "./decide.js";
 import { installCron, removeCronJob, isCronInstalled, parseInterval } from "./cron.js";
 import { spawn } from "node:child_process";
@@ -20,14 +20,8 @@ import {
   killSession as tmuxKillSession,
   paneCurrentCommand,
   ensurePaneAtShell,
-  capturePane,
-  sendEnter,
-  sendLiteral,
-  sendKey,
   DEFAULT_TMUX_NAME,
 } from "./tmux.js";
-import { modalSignature } from "./tui.js";
-import { sleep } from "./util.js";
 import { pokeTmuxWorker } from "./poke.js";
 import { oneLine } from "./util.js";
 
@@ -118,8 +112,13 @@ export async function cmdLaunch({
   force,           // boolean — enable force-continue; watcher pokes on AWAITING
   maxContinues,    // number  — circuit-breaker limit; falls back to config or 5
   instant,         // boolean — skip LLM summary, forward tick.mjs output verbatim
+  taskLabel,       // optional display-only override for state.workerTask;
+                   // /acc resume passes the picked session's title so the
+                   // status line still reads usefully when task is empty
+                   // (pure resume sends no fresh prompt to claude).
 } = {}) {
-  if (!task || !task.trim()) {
+  const isResumeOrContinue = !!resume || !!continueLatest;
+  if (!isResumeOrContinue && (!task || !task.trim())) {
     return { ok: false, text: "usage: /auto-claude-code launch <task description>" };
   }
   if (!cwd) {
@@ -178,6 +177,25 @@ export async function cmdLaunch({
   }
 
   const tmuxName = pluginConfig.tmuxName || DEFAULT_TMUX_NAME;
+  const resolvedForce = force ?? !!pluginConfig.force;
+  const resolvedMaxContinues =
+    maxContinues ?? pluginConfig.maxAutoContinues ?? undefined;
+  const configInstant = pluginConfig.instant !== false;
+  const resolvedInstant = instant !== undefined ? instant : configInstant;
+
+  // Spawn the watcher BEFORE launchWorker so its hook server is bound on
+  // :7779 by the time claude initializes its MCP client. Otherwise claude
+  // hits ConnectionRefused, marks acc_ask_user "failed", and falls back to
+  // native AskUserQuestion (the TUI form we're trying to bypass).
+  // Watcher polls for state.workerSessionId for a few seconds before
+  // exiting, so the gap between this spawn and the updateState below is fine.
+  const watcherPid = spawnWatcher({
+    stateDir: ctx.stateDir,
+    notify: resolvedInstant ? ctx.notify : null,
+    force: resolvedForce,
+    maxContinues: resolvedMaxContinues,
+  });
+
   const launched = await launchWorker({
     cwd,
     task,
@@ -187,33 +205,30 @@ export async function cmdLaunch({
     continueLatest: !!continueLatest,
     forkOnResume: !!fork,
   });
-  if (!launched.ok) return { ok: false, text: `launch failed: ${launched.error}` };
+  if (!launched.ok) {
+    // Watcher was spawned ahead of us — kill it so it doesn't sit polling
+    // for state that will never come.
+    try { process.kill(watcherPid, "SIGTERM"); } catch {}
+    return { ok: false, text: `launch failed: ${launched.error}` };
+  }
 
-  const resolvedForce = force ?? !!pluginConfig.force;
-  const resolvedMaxContinues =
-    maxContinues ?? pluginConfig.maxAutoContinues ?? undefined;
-  const configInstant = pluginConfig.instant !== false;
-  const resolvedInstant = instant !== undefined ? instant : configInstant;
-
-  // Always spawn the watcher — it's the only process that can (a) react to
-  // end_turn the moment it lands (force-continue), (b) push streaming chat
-  // in instant mode, and (c) auto-approve Claude Code's sensitive-file
-  // modal that --dangerously-skip-permissions doesn't cover. Features (a)
-  // and (b) are gated internally on the launch flags, but (c) runs as long
-  // as the watcher is alive, so we need the watcher regardless of mode.
-  const watcherPid = spawnWatcher({
-    stateDir: ctx.stateDir,
-    notify: resolvedInstant ? ctx.notify : null,
-    force: resolvedForce,
-    maxContinues: resolvedMaxContinues,
-  });
+  // Pure resume sends no fresh prompt — `launched.task` is empty in that
+  // case, so fall back to the explicit display label (set by /acc resume),
+  // or the retired session's last task when resuming "last".
+  const recordedTask =
+    launched.task ||
+    taskLabel ||
+    (resume === true || resume === "last" || resume === "latest"
+      ? prior.lastTask
+      : null) ||
+    null;
 
   updateState(ctx.stateDir, (prev) => ({
     ...prev,
     workerSessionId: launched.sessionId,
     workerTmuxName: launched.tmuxName,
     workerCwd: launched.cwd,
-    workerTask: launched.task,
+    workerTask: recordedTask,
     workerSessionJsonl: locateSessionJsonl(cwd, launched.sessionId),
     launchedAt: launched.launchedAt,
     // Sticky routing: chats that launched this worker should have their
@@ -254,8 +269,9 @@ export async function cmdLaunch({
   const shortSid = (launched.sessionId || "").slice(0, 8);
   const readyFailed = launched.ready?.ok === false;
 
+  const summaryLabel = launched.task || recordedTask || `session ${shortSid}`;
   const lines = [
-    `${headerEmoji} ${headerVerb} — ${summarizeTask(launched.task)}`,
+    `${headerEmoji} ${headerVerb} — ${summarizeTask(summaryLabel)}`,
     `↳ session: ${shortSid}  ·  tmux: ${launched.tmuxName}`,
   ];
   if (readyFailed) {
@@ -438,6 +454,143 @@ export async function cmdAttach({ pluginConfig = {} } = {}) {
   };
 }
 
+// `/acc resume` — list recent claude sessions for the relevant cwd (no args)
+// or resume one. The picker shows the original task title (extracted from
+// the first user message in the jsonl) so the user doesn't have to remember
+// which UUID was which.
+//
+// Targets:
+//   (empty)               → list mode
+//   <n>                   → resume the n-th session from the listing
+//   <session-id>          → resume that specific session UUID
+//   last                  → resume the most recently retired session (same
+//                           as `--resume-last`)
+//
+// Anything trailing the target is treated as a fresh prompt to inject into
+// the resumed session — `/acc resume 2 keep going on the lint failures`.
+export async function cmdResume({ pluginConfig = {}, args = "" } = {}) {
+  const ctx = buildCtx(pluginConfig);
+  const prior = loadState(ctx.stateDir);
+  // Pick the cwd whose project dir we'll scan. Live worker > most-recently
+  // retired > plugin default > process cwd. The fallthroughs let `resume`
+  // work even when no worker is currently running.
+  const cwd =
+    prior.workerCwd ||
+    prior.lastCwd ||
+    pluginConfig.defaultCwd ||
+    process.cwd();
+
+  const trimmed = (args ?? "").trim();
+  if (!trimmed || trimmed === "list" || trimmed === "ls") {
+    return formatResumeListing(cwd);
+  }
+
+  const m = trimmed.match(/^(\S+)\s*(.*)$/);
+  const target = m[1].toLowerCase();
+  const extraPrompt = (m[2] || "").trim();
+
+  if (target === "last" || target === "latest") {
+    if (!prior.lastSessionId) {
+      return {
+        ok: false,
+        text: "no retired session recorded yet — start one with /acc launch <task>",
+      };
+    }
+    return cmdLaunch({
+      pluginConfig,
+      cwd,
+      task: extraPrompt,
+      taskLabel: prior.lastTask,
+      resume: "last",
+    });
+  }
+
+  // Numeric index into the listing.
+  if (/^\d{1,2}$/.test(target)) {
+    const sessions = listRecentSessions(cwd, { limit: 10 });
+    const idx = Number(target) - 1;
+    const pick = sessions[idx];
+    if (!pick) {
+      return {
+        ok: false,
+        text: sessions.length
+          ? `no session #${target} (only ${sessions.length} listed under ${cwd})`
+          : `no claude sessions found under ${cwd}`,
+      };
+    }
+    return cmdLaunch({
+      pluginConfig,
+      cwd,
+      task: extraPrompt,
+      taskLabel: pick.title,
+      resume: pick.sessionId,
+    });
+  }
+
+  // Treat as a session id (claude uses 8-4-4-4-12 hex). UUIDs are
+  // case-insensitive so the lowercased `target` is fine.
+  if (/^[0-9a-f-]{6,}$/i.test(target)) {
+    const jsonl = locateSessionJsonl(cwd, target);
+    const title = jsonl ? readFirstUserMessage(jsonl) : "";
+    return cmdLaunch({
+      pluginConfig,
+      cwd,
+      task: extraPrompt,
+      taskLabel: title,
+      resume: target,
+    });
+  }
+
+  return {
+    ok: false,
+    text: [
+      "usage:",
+      "  /acc resume                  list recent sessions",
+      "  /acc resume <n>              resume the n-th from the list",
+      "  /acc resume <session-id>     resume by UUID",
+      "  /acc resume last             resume the most recently retired session",
+      "  /acc resume <…> <prompt>     same, plus inject a fresh prompt",
+    ].join("\n"),
+  };
+}
+
+function formatResumeListing(cwd) {
+  const sessions = listRecentSessions(cwd, { limit: 10 });
+  if (!sessions.length) {
+    return {
+      ok: false,
+      text: [
+        `no claude sessions found under ${cwd}`,
+        "(start one with: /acc launch <task>)",
+      ].join("\n"),
+    };
+  }
+  const rows = sessions.map((s, i) => {
+    const sid = s.sessionId.slice(0, 8);
+    const age = formatAge(Date.now() - s.mtimeMs).padStart(5);
+    const title = oneLine(s.title || "(no message recorded)", 70);
+    return `  ${String(i + 1).padStart(2)}. ${sid}  ${age}  ${title}`;
+  });
+  return {
+    ok: true,
+    text: [
+      `recent claude sessions in ${cwd}:`,
+      ...rows,
+      "",
+      "resume:  /acc resume <n>   |   /acc resume <session-id>   |   /acc resume last",
+      "         (append a prompt after the target to inject one on resume)",
+    ].join("\n"),
+  };
+}
+
+function formatAge(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h`;
+  return `${Math.floor(sec / 86400)}d`;
+}
+
 // Send a free-form message into whichever claude REPL is currently running
 // inside the worker tmux. No new session, no new cron — just a turn tacked
 // onto the existing conversation. Used when the user types
@@ -446,17 +599,13 @@ export async function cmdSend({ pluginConfig = {}, message } = {}) {
   const text = (message ?? "").trim();
   if (!text) return { ok: false, text: "usage: /auto-claude-code <message to running worker>" };
 
-  // Auto-detect "form CSV" payload: a single digit like `1`, or a CSV of
-  // digits / skip / submit / quoted text like `1,2,"stuff",submit`. Those
-  // reply patterns target form/modal UI, so route them through cmdForm
-  // (which drives tmux with per-answer navigation) instead of a plain
-  // paste. Plain prose messages fall through to the normal send.
-  // Multi-tab form answers (with commas) go through cmdForm so we do the
-  // per-tab paste + Right navigation. A single-answer reply like `/acc 1`
-  // stays with the normal paste + Enter path — that's what a single modal
-  // expects and matches what a user would type by hand.
-  if (text.includes(",") && looksLikeFormAnswer(text)) {
-    return cmdForm({ pluginConfig, csv: text });
+  // First: if the watcher's hook server has a pending acc_ask_user
+  // question, route this reply there — claude is blocked on the MCP
+  // tool call waiting for the answer. Watcher handles the dispatch.
+  // Falls through to normal sticky-paste if no question is pending.
+  const delivered = await tryDeliverPendingAnswer(text);
+  if (delivered) {
+    return { ok: true, text: `delivered answer to pending acc_ask_user question` };
   }
 
   const fallbackTmux = pluginConfig.tmuxName || DEFAULT_TMUX_NAME;
@@ -482,192 +631,27 @@ export async function cmdSend({ pluginConfig = {}, message } = {}) {
   };
 }
 
-// Decide whether `text` is a form-answer-style payload (digit / CSV of
-// digits+skip+submit+quoted-text) rather than a regular prose message.
-// Conservative by design — prose like "hello, world" must NOT route to
-// cmdForm (that would reject with a validation error and confuse the user).
-// We require every comma-separated slot to be a form token; anything else
-// falls through to normal send.
-function looksLikeFormAnswer(text) {
-  const t = text.trim();
-  if (!t) return false;
-  const tokens = splitFormCsv(t);
-  if (tokens.length === 0) return false;
-  return tokens.every((tok) => {
-    if (tok.empty) return false;
-    if (tok.quoted) return true;
-    return /^(\d{1,2}|skip|submit)$/i.test(tok.text);
-  });
-}
+// ---- watcher hook bridge ----
 
-// Fill a Claude Code multi-step form by pasting each answer and navigating
-// with ← / → / Enter keys. Also drives single-question modals — `/acc 1`
-// auto-routes here as a 1-element CSV.
-//
-// CSV token grammar (one per tab, in tab order):
-//   \d{1,2}        — press that digit (select a numbered option)
-//   skip           — leave the tab's current state untouched
-//   submit         — press Enter and stop (optional — see below)
-//   "quoted text"  — paste the text literally (free-text tabs)
-//
-// Unquoted non-digit words are rejected so typos don't silently get typed
-// into a numbered-option tab. Malformed input returns a usage error so the
-// user can retype rather than trash their form.
-//
-// After the last answer we auto-press Enter, so `submit` is optional —
-// `/acc form 1,2,3,4` == `/acc form 1,2,3,4,submit`.
-//
-// Auto-advance: Claude Code's TUI select-and-advances on a digit press. If
-// we always sent Right after every paste we'd skip the next tab. So after
-// each non-last paste we compare the modal body signature before vs. after
-// the keypress; only when it DIDN'T change do we send Right ourselves.
-export async function cmdForm({ pluginConfig = {}, csv } = {}) {
-  const raw = (csv ?? "").trim();
-  if (!raw) {
-    return { ok: false, text: "usage: /acc form 1,2,\"text\",skip,submit" };
-  }
-  const ctx = buildCtx(pluginConfig);
-  const st = loadState(ctx.stateDir);
-  const tmuxName = st.workerTmuxName || pluginConfig.tmuxName || DEFAULT_TMUX_NAME;
-  if (!(await tmuxHasSession(tmuxName))) {
-    return { ok: false, text: `no tmux session '${tmuxName}' to drive` };
-  }
-
-  const parsed = parseAndValidateFormAnswers(raw);
-  if (!parsed.ok) {
-    return {
-      ok: false,
-      text: [
-        `form: ${parsed.error}`,
-        `expected CSV of: digit (e.g. 1), skip, submit, or "quoted text"`,
-        `example: /acc 1,2,"my-repo",submit`,
-        `got: ${raw}`,
-      ].join("\n"),
-    };
-  }
-  const answers = parsed.answers;
-
-  const log = [];
-  let preSig = await paneSig(tmuxName);
-  for (let i = 0; i < answers.length; i++) {
-    const a = answers[i];
-    const isLast = i === answers.length - 1;
-    try {
-      if (a.kind === "skip") {
-        log.push(`skip`);
-      } else if (a.kind === "submit") {
-        await sendEnter(tmuxName);
-        log.push(`submit`);
-        break;
-      } else if (a.kind === "digit") {
-        await sendLiteral(tmuxName, a.value);
-        log.push(`digit ${a.value}`);
-      } else {
-        await sendLiteral(tmuxName, a.value);
-        log.push(`text "${a.value}"`);
-      }
-      await sleep(300);
-
-      if (isLast) {
-        await sendEnter(tmuxName);
-        log.push("auto-Enter");
-        break;
-      }
-
-      // Did the TUI auto-advance on the keypress? Compare modal body
-      // signatures: same sig ⇒ still on the same tab ⇒ we send Right;
-      // different sig ⇒ TUI already moved ⇒ skip Right to avoid
-      // double-advancing past the next tab.
-      const postSig = await paneSig(tmuxName);
-      const advanced = postSig && preSig && postSig !== preSig;
-      if (advanced) {
-        log.push(`auto-advanced`);
-      } else {
-        await sendKey(tmuxName, "Right");
-        await sleep(250);
-      }
-      preSig = await paneSig(tmuxName);
-    } catch (err) {
-      log.push(`err on item ${i + 1} (${a.kind}:${a.value}): ${err?.message || err}`);
-      return { ok: false, text: `form drive failed at step ${i + 1}: ${err?.message || err}\nsteps: ${log.join(" → ")}` };
-    }
-  }
-  return { ok: true, text: `form filled: ${log.join(" → ")}` };
-}
-
-// Snapshot the current modal body signature. Empty string when no modal
-// is visible or tmux capture fails.
-async function paneSig(tmuxName) {
+// Forward a chat reply to the watcher's /answer endpoint. If the watcher
+// is up AND has a pending acc_ask_user question, it consumes the answer
+// and unblocks the MCP tool call. Returns true on successful delivery
+// (caller can short-circuit), false otherwise (caller falls through to
+// normal pokeTmuxWorker paste path).
+async function tryDeliverPendingAnswer(text) {
+  const port = process.env.AUTO_CLAUDE_CODE_HOOK_PORT || "7779";
+  const url = `http://127.0.0.1:${port}/answer`;
   try {
-    const pane = await capturePane(tmuxName, { lines: 40 });
-    return modalSignature(pane);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer: text }),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return false;
+    const body = await resp.json().catch(() => ({}));
+    return !!body.delivered;
   } catch {
-    return "";
+    return false;   // watcher not up / busy → silent fall-through
   }
-}
-
-// Parse a CSV of form answers and validate every token. Returns
-//   { ok: true,  answers: [{ kind: "digit"|"text"|"skip"|"submit", value }] }
-// or an explanatory error so the caller can tell the user what's wrong and
-// prompt them to re-enter instead of pasting garbage into the TUI.
-function parseAndValidateFormAnswers(input) {
-  const tokens = splitFormCsv(input);
-  if (tokens.length === 0) return { ok: false, error: "parsed 0 answers from CSV" };
-  const answers = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const tok = tokens[i];
-    if (tok.empty) {
-      return { ok: false, error: `empty slot at position ${i + 1} (did you mean skip?)` };
-    }
-    if (tok.quoted) {
-      answers.push({ kind: "text", value: tok.text });
-      continue;
-    }
-    const t = tok.text;
-    if (/^\d{1,2}$/.test(t)) {
-      answers.push({ kind: "digit", value: t });
-    } else if (/^skip$/i.test(t)) {
-      answers.push({ kind: "skip", value: "" });
-    } else if (/^submit$/i.test(t)) {
-      answers.push({ kind: "submit", value: "" });
-    } else {
-      return {
-        ok: false,
-        error: `invalid token '${t}' at position ${i + 1}; wrap free text in "quotes" or use digit/skip/submit`,
-      };
-    }
-  }
-  return { ok: true, answers };
-}
-
-// CSV splitter that preserves quote context:
-//   { text, quoted, empty }
-// `quoted` = the token was wrapped in double quotes (so `""` is kept as an
-// empty quoted string, distinct from a missing slot).
-// `empty`  = the slot had no content at all — the middle of `1,,2`.
-function splitFormCsv(input) {
-  const out = [];
-  let buf = "";
-  let inQuotes = false;
-  let wasQuoted = false;
-  for (let i = 0; i < input.length; i++) {
-    const c = input[i];
-    if (inQuotes) {
-      if (c === '"') { inQuotes = false; continue; }
-      buf += c;
-      continue;
-    }
-    if (c === '"') { inQuotes = true; wasQuoted = true; continue; }
-    if (c === ",") {
-      const trimmed = buf.trim();
-      out.push({ text: trimmed, quoted: wasQuoted, empty: !wasQuoted && trimmed === "" });
-      buf = "";
-      wasQuoted = false;
-      continue;
-    }
-    buf += c;
-  }
-  const trimmed = buf.trim();
-  out.push({ text: trimmed, quoted: wasQuoted, empty: !wasQuoted && trimmed === "" });
-  return out;
 }

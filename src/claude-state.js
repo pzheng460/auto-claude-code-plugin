@@ -6,6 +6,7 @@ import {
   closeSync,
   readSync,
   fstatSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +30,107 @@ function slugifyCwd(cwd) {
   // Observed Claude Code convention: "/home/alice/foo.bar" → "-home-alice-foo-bar".
   // One regex pass: leading slash run collapses to "-", then each /, ., _ also.
   return cwd.replace(/^\/+|[/._]/g, "-");
+}
+
+// First 256 KiB of any session jsonl is more than enough to find the first
+// user message. Bigger sessions don't make us read more — title extraction
+// stops at the first hit anyway.
+const TITLE_SCAN_BYTES = 256 * 1024;
+
+// Two kinds of "user" messages we want to skip when picking a title:
+//  1. Claude Code's slash-command and system envelopes (`<command-name>` etc.)
+//  2. auto-claude-code's own watchdog nudges (poke.js / cron.js outputs)
+// Both look like user input in the jsonl but aren't the task the human typed.
+const WRAPPER_PREFIXES = [
+  "<command-name>",
+  "<command-message>",
+  "<local-command-stdout>",
+  "<local-command-stderr>",
+  "<system-reminder>",
+  "Caveat:",
+  "auto-claude-code watchdog:",
+  "auto-claude-code heartbeat",
+];
+
+// Substring patterns that mark watchdog heartbeats — these can appear after
+// an emoji prefix, so prefix-matching alone misses them.
+const WRAPPER_SUBSTRINGS = [
+  "auto-claude-code heartbeat",
+  "auto-claude-code watchdog:",
+];
+
+// Recent claude session jsonls under `cwd`, newest first, each enriched
+// with a `title` extracted from the first prose user message. Used by
+// `/acc resume` to render a numbered picker.
+export function listRecentSessions(cwd, { limit = 10 } = {}) {
+  if (!cwd) return [];
+  const dir = join(PROJECTS_DIR, slugifyCwd(cwd));
+  let names;
+  try { names = readdirSync(dir); } catch { return []; }
+  const items = [];
+  for (const n of names) {
+    if (!n.endsWith(".jsonl")) continue;
+    const path = join(dir, n);
+    let st;
+    try { st = statSync(path); } catch { continue; }
+    if (!st.isFile()) continue;
+    items.push({
+      sessionId: n.replace(/\.jsonl$/, ""),
+      jsonlPath: path,
+      mtimeMs: st.mtimeMs,
+      sizeBytes: st.size,
+    });
+  }
+  items.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const top = items.slice(0, limit);
+  for (const s of top) s.title = readFirstUserMessage(s.jsonlPath);
+  return top;
+}
+
+// Pull the first prose user message from a session jsonl — the original
+// task text that started the session. Returns "" if nothing usable is
+// found within the first `maxBytes`.
+export function readFirstUserMessage(jsonlPath, maxBytes = TITLE_SCAN_BYTES) {
+  if (!jsonlPath) return "";
+  let fd;
+  try { fd = openSync(jsonlPath, "r"); } catch { return ""; }
+  try {
+    const { size } = fstatSync(fd);
+    const len = Math.min(size, maxBytes);
+    if (len <= 0) return "";
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, 0);
+    const lines = buf.toString("utf8").split("\n");
+    // Drop a possibly truncated last line unless we read the whole file.
+    if (len < size && lines.length) lines.pop();
+    for (const line of lines) {
+      if (!line) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      if (ev?.type !== "user" || ev.isSidechain) continue;
+      const c = ev.message?.content;
+      let body = "";
+      if (typeof c === "string") body = c;
+      else if (Array.isArray(c)) {
+        for (const block of c) {
+          if (block?.type === "text" && typeof block.text === "string") {
+            body = block.text;
+            break;
+          }
+        }
+      }
+      body = body.trim();
+      if (!body) continue;
+      if (WRAPPER_PREFIXES.some((p) => body.startsWith(p))) continue;
+      // First non-whitespace ~80 chars: watchdog headers usually fit there.
+      const head = body.slice(0, 100);
+      if (WRAPPER_SUBSTRINGS.some((s) => head.includes(s))) continue;
+      return body;
+    }
+    return "";
+  } finally {
+    try { closeSync(fd); } catch {}
+  }
 }
 
 export function locateSessionJsonl(cwd, sessionId) {

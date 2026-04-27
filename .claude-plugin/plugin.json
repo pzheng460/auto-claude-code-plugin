@@ -1,0 +1,11 @@
+{
+  "name": "auto-claude-code",
+  "description": "auto-claude-code Claude Code plugin — hooks for session lifecycle + AskUserQuestion routing to remote chat (Feishu/TG via openclaw sticky channel).",
+  "version": "0.1.0-experimental",
+  "mcpServers": {
+    "acc": {
+      "type": "http",
+      "url": "http://127.0.0.1:7779/mcp"
+    }
+  }
+}

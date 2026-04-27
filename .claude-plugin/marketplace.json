@@ -1,0 +1,11 @@
+{
+  "name": "local-auto-claude-code",
+  "owner": { "name": "local" },
+  "plugins": [
+    {
+      "name": "auto-claude-code",
+      "source": "./",
+      "description": "auto-claude-code Claude Code plugin (hook + MCP layer over openclaw watcher)"
+    }
+  ]
+}
