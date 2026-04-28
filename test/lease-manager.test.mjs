@@ -1,17 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  buildLeaseEnv,
-  explicitPoolRequests,
-  releaseAll,
-  retryOrphans,
-  loadOrphans,
   appendOrphans,
+  buildLeaseEnv,
   dropOrphans,
+  explicitPoolRequests,
+  loadOrphans,
+  pluginManifestRender,
+  pluginManifestRequests,
+  releaseAll,
+  renderTemplates,
+  retryOrphans,
 } from "../src/lease-manager.js";
 
 const freshDir = () => mkdtempSync(join(tmpdir(), "lease-test-"));
@@ -113,4 +116,99 @@ test("retryOrphans keeps still-failing entries with refreshed lastErr", async ()
   const left = loadOrphans(stateDir);
   assert.deepEqual(left.map((o) => o.leaseId), ["BAD"]);
   assert.match(left[0].lastErr, /still down/);
+});
+
+// ---- harness.json render directives + renderTemplates ------------------
+
+function pluginRootWith(harnessJson, templates = {}) {
+  const root = freshDir();
+  mkdirSync(`${root}/.claude-plugin`, { recursive: true });
+  writeFileSync(`${root}/.claude-plugin/harness.json`, JSON.stringify(harnessJson, null, 2));
+  for (const [path, body] of Object.entries(templates)) {
+    const full = join(root, path);
+    mkdirSync(join(full, ".."), { recursive: true });
+    writeFileSync(full, body);
+  }
+  return root;
+}
+
+test("pluginManifestRender returns null when harness.json has no render array", () => {
+  const root = pluginRootWith({ pools: [{ alias: "npu", pool: "npu-pool" }] });
+  assert.equal(pluginManifestRender(root), null);
+});
+
+test("pluginManifestRender normalizes directives", () => {
+  const root = pluginRootWith({
+    pools: [],
+    render: [
+      { template: "tmpl/a.tmpl", target: "~/.foo/a.yaml" },                 // backup defaults to true
+      { template: "tmpl/b.tmpl", target: "/tmp/b.yaml", backup: false },
+      { template: 123, target: "x" },                                       // bad → filtered
+    ],
+  });
+  const out = pluginManifestRender(pluginRootWith({ pools: [], render: [] }));  // empty manifest
+  assert.equal(out, null);
+
+  const ds = pluginManifestRender(root);
+  assert.equal(ds.length, 2);
+  assert.equal(ds[0].backup, true);
+  assert.equal(ds[1].backup, false);
+});
+
+test("renderTemplates substitutes ${VAR} and ${VAR:-default}", () => {
+  const root = pluginRootWith(
+    {},
+    { "config.yaml.tmpl": "host: ${REMOTE_HOST_NPU}\nport: ${REMOTE_PORT_NPU:-22}\nrole: ${MISSING:-fallback}\n" },
+  );
+  const target = join(freshDir(), "deep", "subdir", "out.yaml");
+  const out = renderTemplates({
+    pluginRoot: root,
+    directives: [{ template: "config.yaml.tmpl", target, backup: false }],
+    env: { REMOTE_HOST_NPU: "1.2.3.4" },
+  });
+  assert.deepEqual(out.errors, []);
+  assert.equal(out.rendered.length, 1);
+  assert.equal(readFileSync(target, "utf8"), "host: 1.2.3.4\nport: 22\nrole: fallback\n".replace("port: 22", "port: 22"));
+});
+
+test("renderTemplates backs up an existing target when backup=true", () => {
+  const stateDir = freshDir();
+  const target = join(stateDir, "config.yaml");
+  writeFileSync(target, "OLD CONTENT\n");
+
+  const root = pluginRootWith({}, { "t.tmpl": "NEW ${X}\n" });
+  const out = renderTemplates({
+    pluginRoot: root,
+    directives: [{ template: "t.tmpl", target, backup: true }],
+    env: { X: "DATA" },
+  });
+  assert.equal(out.errors.length, 0);
+  assert.equal(readFileSync(target, "utf8"), "NEW DATA\n");
+
+  const siblings = readdirSync(stateDir);
+  const backup = siblings.find((f) => f.startsWith("config.yaml.before-pool-"));
+  assert.ok(backup, `expected a backup file, got ${siblings.join(",")}`);
+  assert.equal(readFileSync(join(stateDir, backup), "utf8"), "OLD CONTENT\n");
+});
+
+test("renderTemplates reports missing template without throwing", () => {
+  const root = freshDir();
+  const out = renderTemplates({
+    pluginRoot: root,
+    directives: [{ template: "nope.tmpl", target: join(freshDir(), "x.yaml") }],
+    env: {},
+  });
+  assert.equal(out.rendered.length, 0);
+  assert.equal(out.errors.length, 1);
+  assert.match(out.errors[0].error, /template not found/);
+});
+
+test("renderTemplates skips directives missing template/target", () => {
+  const out = renderTemplates({
+    pluginRoot: freshDir(),
+    directives: [{ template: "x" }, {}],
+    env: {},
+  });
+  assert.equal(out.rendered.length, 0);
+  assert.equal(out.errors.length, 2);
 });

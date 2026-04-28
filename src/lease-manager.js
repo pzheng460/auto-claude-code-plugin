@@ -3,8 +3,17 @@
 // on stop / death / orphan-cleanup. Failures of any single op are isolated
 // — orphans are persisted so cmdGc can sweep them on daemon restart.
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 
 const ORPHAN_FILE = "orphan_leases.json";
 
@@ -36,6 +45,32 @@ export function pluginManifestRequests(pluginRoot) {
   }
   const pools = Array.isArray(raw.pools) ? raw.pools : [];
   return pools_to_requests(pools, path);
+}
+
+/**
+ * Read the optional `render` directives from a plugin's harness.json.
+ * Returns null when the manifest is missing or has no render entries.
+ *
+ *   render: [
+ *     { "template": "templates/config.yaml.tmpl",
+ *       "target":   "~/.npu/config.yaml",
+ *       "backup":   true                  // default true
+ *     }
+ *   ]
+ */
+export function pluginManifestRender(pluginRoot) {
+  const path = join(pluginRoot, ".claude-plugin", "harness.json");
+  if (!existsSync(path)) return null;
+  let raw;
+  try { raw = JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+  if (!Array.isArray(raw.render) || raw.render.length === 0) return null;
+  return raw.render
+    .filter((d) => d && typeof d.template === "string" && typeof d.target === "string")
+    .map((d) => ({
+      template: d.template,
+      target: d.target,
+      backup: d.backup !== false,
+    }));
 }
 
 function pools_to_requests(entries, sourcePath) {
@@ -209,6 +244,73 @@ export function buildLeaseEnv(leases) {
     if (l.user) env[`REMOTE_USER_${sfx}`] = l.user;
   }
   return env;
+}
+
+// ---------- template rendering -----------------------------------------
+
+function expandHome(p) {
+  if (typeof p !== "string") return p;
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
+}
+
+// Substitute ${VAR} and ${VAR:-default} occurrences in `body` using `env`.
+// Missing vars with no default render as empty (caller can pre-validate).
+function substituteEnv(body, env) {
+  return body.replace(/\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}/g, (_, name, fallback) => {
+    const v = env[name];
+    if (v !== undefined && v !== "") return String(v);
+    return fallback !== undefined ? fallback : "";
+  });
+}
+
+/**
+ * Render a plugin's harness.json `render` directives.
+ *
+ * Each directive is { template, target, backup? }. The template path is
+ * resolved relative to pluginRoot; the target supports `~/` home
+ * expansion. When backup is true (default), an existing target is copied
+ * to `<target>.before-pool-<UTC>` before being overwritten. Missing
+ * directories on the target path are created.
+ *
+ * Substitution syntax mirrors bash: `${VAR}` and `${VAR:-default}`. Vars
+ * read from the supplied `env` (caller usually merges process.env with
+ * lease env from buildLeaseEnv).
+ *
+ * Returns { rendered: [{template,target}], errors: [{template,error}] }.
+ * Never throws — broken directives are reported, the rest still run.
+ */
+export function renderTemplates({ pluginRoot, directives, env }) {
+  const rendered = [];
+  const errors = [];
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const d of directives || []) {
+    try {
+      if (!d?.template || !d?.target) {
+        errors.push({ template: d?.template || "(missing)", error: "directive missing template/target" });
+        continue;
+      }
+      const tplPath = isAbsolute(d.template) ? d.template : join(pluginRoot, d.template);
+      if (!existsSync(tplPath)) {
+        errors.push({ template: d.template, error: `template not found: ${tplPath}` });
+        continue;
+      }
+      const body = substituteEnv(readFileSync(tplPath, "utf8"), env || {});
+      const target = expandHome(d.target);
+      mkdirSync(dirname(target), { recursive: true });
+      if (d.backup !== false && existsSync(target)) {
+        copyFileSync(target, `${target}.before-pool-${ts}`);
+      }
+      const tmp = `${target}.tmp.${process.pid}.${Date.now()}`;
+      writeFileSync(tmp, body, { mode: 0o600 });
+      renameSync(tmp, target);
+      rendered.push({ template: d.template, target });
+    } catch (err) {
+      errors.push({ template: d?.template || "(unknown)", error: err?.message || String(err) });
+    }
+  }
+  return { rendered, errors };
 }
 
 // ---------- orphan persistence -----------------------------------------

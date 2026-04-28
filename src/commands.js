@@ -33,8 +33,10 @@ import {
   acquireGroup,
   buildLeaseEnv,
   explicitPoolRequests,
+  pluginManifestRender,
   pluginManifestRequests,
   releaseAll,
+  renderTemplates,
   retryOrphans,
 } from "./lease-manager.js";
 
@@ -148,6 +150,24 @@ async function acquireLeasesIfRequested({
   if (!result.ok) {
     throw new Error(`broker acquire failed for ${result.failedPool}: ${result.error}`);
   }
+
+  // Optional: render harness.json `render` directives now that we know
+  // the lease env. Only meaningful in --plugin mode (manifest-driven).
+  if (pluginName) {
+    const pluginRoot = resolveClaudePluginRoot(pluginConfig, pluginName);
+    const directives = pluginManifestRender(pluginRoot);
+    if (directives?.length) {
+      const env = { ...process.env, ...buildLeaseEnv(result.leases) };
+      const out = renderTemplates({ pluginRoot, directives, env });
+      if (out.rendered.length) {
+        log(`render: wrote ${out.rendered.length} file(s) — ${out.rendered.map((r) => r.target).join(", ")}`);
+      }
+      for (const e of out.errors) {
+        log(`render: ${e.template} failed: ${e.error}`);
+      }
+    }
+  }
+
   return { broker, leases: result.leases };
 }
 
