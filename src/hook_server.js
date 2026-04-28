@@ -75,7 +75,6 @@ export function pendingCount() {
   return pending.size;
 }
 
-
 // ---- request routing ----
 
 async function handleRequest(req, res) {

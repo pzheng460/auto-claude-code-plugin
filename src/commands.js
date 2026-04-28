@@ -25,10 +25,123 @@ import {
 import { pokeTmuxWorker } from "./poke.js";
 import { oneLine } from "./util.js";
 
+// Pool / lease integration -------------------------------------------------
+import { homedir } from "node:os";
+import { BrokerClient } from "./broker-client.js";
+import { syncSshBundle } from "./ssh-sync.js";
+import {
+  acquireGroup,
+  buildLeaseEnv,
+  explicitPoolRequests,
+  pluginManifestRequests,
+  releaseAll,
+} from "./lease-manager.js";
+
 const DEFAULT_CRON_EXPR = "*/5 * * * *";
 const DEFAULT_NUDGE_AFTER_SEC = 600;
 const DEFAULT_RECOVER_AFTER_SEC = 1800;
 const TASK_SUMMARY_CHARS = 80;
+
+const DEFAULT_BROKER_URL = "http://100.106.133.58:7778"; // jcl Tailscale IP
+const DEFAULT_LEASE_TTL_SEC = 600;
+const DEFAULT_CLAUDE_PLUGINS_DIR = `${homedir()}/.claude/plugins`;
+
+// Build a BrokerClient from plugin config + env overrides. Returns null
+// when no broker URL is configured (so callers can keep pool-mode optional).
+function makeBrokerClient(pluginConfig = {}) {
+  const url =
+    process.env.AUTO_CLAUDE_CODE_BROKER_URL ||
+    pluginConfig?.broker?.url ||
+    DEFAULT_BROKER_URL;
+  if (!url) return null;
+  const token =
+    process.env.AUTO_CLAUDE_CODE_BROKER_TOKEN ||
+    pluginConfig?.broker?.token ||
+    null;
+  return new BrokerClient({ baseUrl: url, token });
+}
+
+// Resolve a Claude Code plugin's manifest dir from a plugin name. Honors
+// pluginConfig.claudePluginsDir override; default ~/.claude/plugins.
+function resolveClaudePluginRoot(pluginConfig, pluginName) {
+  const base = pluginConfig?.claudePluginsDir || DEFAULT_CLAUDE_PLUGINS_DIR;
+  return join(base, pluginName);
+}
+
+// Owner string for the broker (audit trail, who's holding this lease).
+// Prefers chat ctx (feishu user / TG chat id) → falls back to host:user.
+function deriveLeaseOwner(ctx, pluginConfig) {
+  const stickyTo = ctx?.notify?.to;
+  if (stickyTo) return `chat:${stickyTo}`;
+  const cfgOwner = pluginConfig?.broker?.owner;
+  if (cfgOwner) return cfgOwner;
+  return `cli:${process.env.USER || "openclaw"}`;
+}
+
+/**
+ * Acquire pool leases when /acc launch was invoked with --plugin or
+ * --pool. Returns null when no pool mode is requested. Throws (caller
+ * surfaces to chat) on broker failures or manifest mistakes.
+ *
+ * On success: { broker, leases: [...] }
+ *
+ * Side effects: ensures ~/.ssh/config.d/harness + ~/.ssh/harness/ are
+ * up to date with the broker's ssh-bundle (only re-fetched when ETag
+ * changes).
+ */
+async function acquireLeasesIfRequested({
+  pluginConfig,
+  pluginName,
+  poolList,
+  stateDir,
+  owner,
+  purpose,
+}) {
+  if (!pluginName && !poolList) return null;
+
+  const broker = makeBrokerClient(pluginConfig);
+  if (!broker) {
+    throw new Error("broker URL not configured (set pluginConfig.broker.url or AUTO_CLAUDE_CODE_BROKER_URL)");
+  }
+
+  // Pull / refresh the ssh bundle FIRST so the keys + config.d/harness exist
+  // before any cc subprocess tries to ssh.
+  const sync = await syncSshBundle({ broker, stateDir });
+  if (sync.changed) {
+    log(`ssh-sync: installed bundle v${sync.version || "?"} (${sync.keyCount} keys)`);
+  }
+
+  // Build the request list: --plugin wins, --pool is the explicit fallback.
+  let requests;
+  if (pluginName) {
+    const pluginRoot = resolveClaudePluginRoot(pluginConfig, pluginName);
+    const fromManifest = pluginManifestRequests(pluginRoot);
+    if (!fromManifest) {
+      throw new Error(`plugin '${pluginName}' has no harness.json at ${pluginRoot}/.claude-plugin/`);
+    }
+    requests = fromManifest;
+  } else if (poolList) {
+    requests = explicitPoolRequests(poolList);
+  } else {
+    requests = [];
+  }
+
+  if (!requests.length) return null;
+
+  const result = await acquireGroup({
+    broker, requests, owner, purpose,
+    ttlSec: DEFAULT_LEASE_TTL_SEC,
+  });
+  if (!result.ok) {
+    throw new Error(`broker acquire failed for ${result.failedPool}: ${result.error}`);
+  }
+  return { broker, leases: result.leases };
+}
+
+function log(msg) {
+  // commands.js doesn't have a real logger; drop into stderr for now.
+  process.stderr.write(`[acc] ${msg}\n`);
+}
 
 function buildCtx(pluginConfig = {}) {
   const parsed = parseInterval(pluginConfig.every || pluginConfig.interval);
@@ -45,21 +158,22 @@ function buildCtx(pluginConfig = {}) {
 
 const summarizeTask = (s) => oneLine(s, TASK_SUMMARY_CHARS);
 
-// Decide whether the watchdog cron should be installed for a launch, and
-// Watcher owns force-continue (it sees end_turn in real time). Cron is now
-// purely for LLM heartbeat rendering in summary mode. In instant mode the
-// watcher streams to chat directly, so the cron stays out of the picture
-// regardless of whether force is on.
+// Decide whether the watchdog cron should be installed for a launch.
+// The watcher is always spawned (it owns Stop hook + acc_ask_user MCP);
+// the cron is only installed in non-instant mode for LLM summary
+// rendering. Force mode swaps the cron template for a slim variant
+// that drops branch/progress/heartbeat fields and skips the
+// long-silence nudge — the watcher's Stop hook already drives forward.
 //
-//   instant  force | watcher                   cron
-//   ---------------+-----------------------------------------------
-//   true     no    | spawn (streams chat)      (none)
-//   true     yes   | spawn (streams + force)   (none)
-//   false    no    | (none)                    install (announce)
-//   false    yes   | spawn (force only, no notify) install (announce)
+//   instant  force | watcher                            | cron
+//   ---------------+------------------------------------+----------------
+//   true     no    | streams chat live                  | (none)
+//   true     yes   | streams chat + Stop-hook continues | (none)
+//   false    no    | force-off, summarizer feeds tick   | full template
+//   false    yes   | force-on, drives every end_turn    | slim template
 export function planCronInstall({ instant, notify }) {
   if (instant) return null;
-  return { notify: notify ?? null, instant: false };
+  return { notify: notify ?? null };
 }
 
 const WATCHER_SCRIPT = pathResolve(
@@ -69,16 +183,20 @@ const WATCHER_SCRIPT = pathResolve(
   "watcher.mjs",
 );
 
-function spawnWatcher({ stateDir, notify, force = false, maxContinues } = {}) {
+function spawnWatcher({ stateDir, notify, streamLiveEvents = false, force = false, maxContinues } = {}) {
   const env = {
     ...process.env,
     AUTO_CLAUDE_CODE_STATE_DIR: stateDir,
   };
+  // Watcher always needs a notify target so acc_ask_user, completion
+  // reports, and retire alerts can reach the user. Live event streaming
+  // (the per-turn assistant text + tool_use push) is gated separately by
+  // STREAM_LIVE_EVENTS — disabled in summary mode where the cron's LLM
+  // summary is the digest path.
   if (notify?.channel) env.AUTO_CLAUDE_CODE_NOTIFY_CHANNEL = notify.channel;
   if (notify?.to) env.AUTO_CLAUDE_CODE_NOTIFY_TO = notify.to;
   if (notify?.account) env.AUTO_CLAUDE_CODE_NOTIFY_ACCOUNT = notify.account;
-  // Force-continue lives inside the watcher now — tick no longer reads
-  // these, so only the watcher needs to be told.
+  if (streamLiveEvents) env.AUTO_CLAUDE_CODE_STREAM_LIVE_EVENTS = "1";
   if (force) env.AUTO_CLAUDE_CODE_FORCE = "1";
   if (Number.isFinite(maxContinues)) {
     env.AUTO_CLAUDE_CODE_MAX_CONTINUES = String(maxContinues);
@@ -116,6 +234,8 @@ export async function cmdLaunch({
                    // /acc resume passes the picked session's title so the
                    // status line still reads usefully when task is empty
                    // (pure resume sends no fresh prompt to claude).
+  plugin,          // Claude Code plugin name; reads its harness.json for pools
+  pool,            // explicit pool list (string, comma-separated)
 } = {}) {
   const isResumeOrContinue = !!resume || !!continueLatest;
   if (!isResumeOrContinue && (!task || !task.trim())) {
@@ -123,6 +243,63 @@ export async function cmdLaunch({
   }
   if (!cwd) {
     return { ok: false, text: "launch: cwd is required" };
+  }
+
+  // Validate inputs BEFORE any destructive cleanup. The priorActive
+  // branch below retires the live worker, so a typo'd resume / --continue
+  // / --fork combo would otherwise kill the running session and leave
+  // the user with no way out but /acc exit.
+
+  // Explicit resume sid must point to an actual jsonl. `last`/`latest`
+  // is resolved later against prior.lastSessionId and re-checked there.
+  if (
+    typeof resume === "string" &&
+    resume.trim() &&
+    resume !== "last" &&
+    resume !== "latest"
+  ) {
+    const probe = resume.trim();
+    if (!locateSessionJsonl(cwd, probe)) {
+      return {
+        ok: false,
+        text: `resume failed: no claude session ${probe} under ${cwd}`,
+      };
+    }
+  }
+
+  // --continue needs at least one historical session under cwd, otherwise
+  // claude CLI errors out and the worker tmux sits at the shell.
+  //
+  // We also REWRITE --continue into an explicit --resume <latest sid>: the
+  // downstream launchWorker generates a random session id when only
+  // continueLatest is set, which then mismatches the real jsonl claude
+  // touches when continuing — waitForClaudeReady times out, state's
+  // workerSessionId becomes a ghost UUID, and the watcher reports DEAD
+  // forever. Pre-resolving to the latest session id makes --continue
+  // behave identically to /acc resume <latest>.
+  if (continueLatest && !resume) {
+    const recent = listRecentSessions(cwd, { limit: 1 });
+    if (!recent.length) {
+      return {
+        ok: false,
+        text: `--continue failed: no claude sessions found under ${cwd} to continue`,
+      };
+    }
+    resume = recent[0].sessionId;
+    continueLatest = false;
+    // Carry the picked session's title forward so the status line shows
+    // something meaningful when --continue replaces a typed task.
+    if (!taskLabel && recent[0].title) taskLabel = recent[0].title;
+  }
+
+  // --fork-session is only meaningful when paired with resume/continue.
+  // launch.js silently drops it otherwise; surface that as an error so
+  // the user knows their flag had no effect.
+  if (fork && !resume && !continueLatest) {
+    return {
+      ok: false,
+      text: "--fork requires --resume <id>, --resume last, or --continue",
+    };
   }
 
   const ctx = buildCtx(pluginConfig);
@@ -189,9 +366,37 @@ export async function cmdLaunch({
   // native AskUserQuestion (the TUI form we're trying to bypass).
   // Watcher polls for state.workerSessionId for a few seconds before
   // exiting, so the gap between this spawn and the updateState below is fine.
+  // Always give the watcher the notify channel — it pushes acc_ask_user
+  // questions, DONE/BLOCKED reports, circuit-breaker, and retire alerts
+  // through it regardless of mode. Live event streaming (per-turn
+  // assistant text & tool calls) is gated by streamLiveEvents — only on
+  // in instant mode where the cron LLM summary isn't the digest path.
+  // Pool / lease setup — runs before the watcher spawn so a broker failure
+  // surfaces immediately to the user instead of silently leaving them with
+  // a half-launched worker. extraLeaseEnv carries the alias env vars into
+  // the claude shell so plugins can `ssh $REMOTE_SSH_ALIAS_NPU` directly.
+  let leasePack = null;
+  let extraLeaseEnv = null;
+  try {
+    leasePack = await acquireLeasesIfRequested({
+      pluginConfig,
+      pluginName: plugin,
+      poolList: pool,
+      stateDir: ctx.stateDir,
+      owner: deriveLeaseOwner(ctx, pluginConfig),
+      purpose: task ? oneLine(task, 80) : "auto-claude-code launch",
+    });
+    if (leasePack?.leases?.length) {
+      extraLeaseEnv = buildLeaseEnv(leasePack.leases);
+    }
+  } catch (err) {
+    return { ok: false, text: `pool mode aborted: ${err?.message || err}` };
+  }
+
   const watcherPid = spawnWatcher({
     stateDir: ctx.stateDir,
-    notify: resolvedInstant ? ctx.notify : null,
+    notify: ctx.notify,
+    streamLiveEvents: resolvedInstant,
     force: resolvedForce,
     maxContinues: resolvedMaxContinues,
   });
@@ -204,11 +409,19 @@ export async function cmdLaunch({
     resumeSessionId,
     continueLatest: !!continueLatest,
     forkOnResume: !!fork,
+    extraEnv: extraLeaseEnv,
   });
   if (!launched.ok) {
     // Watcher was spawned ahead of us — kill it so it doesn't sit polling
     // for state that will never come.
     try { process.kill(watcherPid, "SIGTERM"); } catch {}
+    // Also release any leases we just acquired — otherwise they sit on the
+    // broker until TTL expires.
+    if (leasePack?.leases?.length) {
+      try {
+        await releaseAll({ broker: leasePack.broker, leases: leasePack.leases, stateDir: ctx.stateDir });
+      } catch {}
+    }
     return { ok: false, text: `launch failed: ${launched.error}` };
   }
 
@@ -238,6 +451,9 @@ export async function cmdLaunch({
     stickyAccount: pluginConfig.sticky === false ? null : (ctx.notify?.account ?? null),
     watcherPid,
     watcherStartedAt: watcherPid ? new Date().toISOString() : null,
+    leases: leasePack?.leases || [],
+    leaseHeartbeatLastOkAt: leasePack?.leases?.length ? new Date().toISOString() : null,
+    leaseHeartbeatFailCount: 0,
   }));
 
   const cronPlan = planCronInstall({
@@ -250,7 +466,7 @@ export async function cmdLaunch({
       stateDir: ctx.stateDir,
       thresholds: ctx.thresholds,
       notify: cronPlan.notify,
-      instant: cronPlan.instant,
+      force: resolvedForce,
     });
     if (!inst.ok) {
       return {
@@ -274,6 +490,12 @@ export async function cmdLaunch({
     `${headerEmoji} ${headerVerb} — ${summarizeTask(summaryLabel)}`,
     `↳ session: ${shortSid}  ·  tmux: ${launched.tmuxName}`,
   ];
+  if (leasePack?.leases?.length) {
+    const summary = leasePack.leases
+      .map((l) => `${l.alias}=${l.hostAlias}`)
+      .join(", ");
+    lines.push(`↳ leases: ${summary} (TTL ${DEFAULT_LEASE_TTL_SEC}s)`);
+  }
   if (readyFailed) {
     // If waitForClaudeReady timed out, the watchdog would otherwise sit on a
     // NONE/IDLE branch forever without ever reaching the worker — tell the
@@ -305,6 +527,23 @@ export async function cmdStop({ pluginConfig = {}, killTmux = false } = {}) {
     }
   }
 
+  // Release pool leases BEFORE we kill cron / tmux. Failures land in
+  // orphan_leases.json so cmdGc / next launch can retry — never block
+  // the stop on broker errors.
+  let leaseReport = null;
+  if (Array.isArray(st.leases) && st.leases.length > 0) {
+    const broker = makeBrokerClient(pluginConfig);
+    if (broker) {
+      try {
+        leaseReport = await releaseAll({ broker, leases: st.leases, stateDir: ctx.stateDir });
+      } catch (err) {
+        leaseReport = { released: [], orphaned: st.leases.map((l) => l.leaseId), err: err?.message };
+      }
+    } else {
+      leaseReport = { released: [], orphaned: st.leases.map((l) => l.leaseId), err: "no broker configured" };
+    }
+  }
+
   let cronRemoved = false;
   if (await isCronInstalled()) {
     const r = await removeCronJob();
@@ -315,7 +554,7 @@ export async function cmdStop({ pluginConfig = {}, killTmux = false } = {}) {
   // Figure out the tmux name to operate on. Usually it's the worker we
   // recorded in state, but if the worker was already retired (or we cleared
   // it) while the user's Claude is still alive in the default tmux, fall
-  // back to the configured/default session name so `/acc stop` can still
+  // back to the configured/default session name so `/acc exit` can still
   // do its job.
   const tmuxCandidate = st.workerTmuxName
     || pluginConfig.tmuxName
@@ -361,13 +600,22 @@ export async function cmdStop({ pluginConfig = {}, killTmux = false } = {}) {
   }
   lines.push(`↳ ${cronRemoved ? "watchdog cron removed" : "no watchdog cron to remove"}`);
   lines.push(`↳ ${describeExitOutcome(exitOutcome, exitError, tmuxCandidate)}`);
+  if (leaseReport) {
+    const okN = leaseReport.released?.length || 0;
+    const orphanN = leaseReport.orphaned?.length || 0;
+    if (orphanN > 0) {
+      lines.push(`↳ leases: released ${okN}, orphaned ${orphanN} (saved for retry)`);
+    } else if (okN > 0) {
+      lines.push(`↳ leases: released ${okN}`);
+    }
+  }
   return { ok: true, text: lines.join("\n") };
 }
 
 // One-line summary that makes it obvious whether Claude Code actually
-// exited. Appears at the top of `/acc stop` output.
+// exited. Appears at the top of `/acc exit` output.
 function stopHeadline(outcome, error) {
-  if (error) return `❌ /acc stop: error (${error})`;
+  if (error) return `❌ /acc exit: error (${error})`;
   switch (outcome) {
     case "ctrl-c":
     case "killed":
@@ -384,13 +632,13 @@ function stopHeadline(outcome, error) {
       if (typeof outcome === "string" && outcome.startsWith("ctrl-c-x")) {
         return "✅ Claude Code exited";
       }
-      return `⚠️ /acc stop finished but exit state is unclear (${outcome})`;
+      return `⚠️ /acc exit finished but exit state is unclear (${outcome})`;
   }
 }
 
 // Thin translator over tmux.ensurePaneAtShell so describeExitOutcome keeps
 // its old vocabulary. ensurePaneAtShell is the shared primitive that both
-// /acc stop and /acc launch (tmux reuse path) use — we spam Ctrl-C until
+// /acc exit and /acc launch (tmux reuse path) use — we spam Ctrl-C until
 // `pane_current_command` is no longer "claude", with no sentinel paste to
 // pollute the REPL.
 async function softExitClaude(tmuxName) {
@@ -468,7 +716,7 @@ export async function cmdAttach({ pluginConfig = {} } = {}) {
 //
 // Anything trailing the target is treated as a fresh prompt to inject into
 // the resumed session — `/acc resume 2 keep going on the lint failures`.
-export async function cmdResume({ pluginConfig = {}, args = "" } = {}) {
+export async function cmdResume({ pluginConfig = {}, args = "", notify = null } = {}) {
   const ctx = buildCtx(pluginConfig);
   const prior = loadState(ctx.stateDir);
   // Pick the cwd whose project dir we'll scan. Live worker > most-recently
@@ -502,6 +750,7 @@ export async function cmdResume({ pluginConfig = {}, args = "" } = {}) {
       task: extraPrompt,
       taskLabel: prior.lastTask,
       resume: "last",
+      notify,
     });
   }
 
@@ -524,20 +773,57 @@ export async function cmdResume({ pluginConfig = {}, args = "" } = {}) {
       task: extraPrompt,
       taskLabel: pick.title,
       resume: pick.sessionId,
+      notify,
     });
   }
 
-  // Treat as a session id (claude uses 8-4-4-4-12 hex). UUIDs are
-  // case-insensitive so the lowercased `target` is fine.
+  // Treat as a session id (claude uses 8-4-4-4-12 hex, 36 chars). UUIDs
+  // are case-insensitive so the lowercased `target` is fine. Anything
+  // shorter than 36 chars is treated as a prefix and resolved against the
+  // recent listing — the picker shows 8-char prefixes, so users can copy
+  // those directly.
   if (/^[0-9a-f-]{6,}$/i.test(target)) {
-    const jsonl = locateSessionJsonl(cwd, target);
-    const title = jsonl ? readFirstUserMessage(jsonl) : "";
+    let fullId = target;
+    if (target.length < 36) {
+      const sessions = listRecentSessions(cwd, { limit: 50 });
+      const matches = sessions.filter((s) =>
+        s.sessionId.toLowerCase().startsWith(target),
+      );
+      if (matches.length === 0) {
+        return {
+          ok: false,
+          text: `no session id starts with "${target}" under ${cwd}`,
+        };
+      }
+      if (matches.length > 1) {
+        const lines = matches
+          .slice(0, 5)
+          .map((s) => `  ${s.sessionId}  ${oneLine(s.title || "(no message recorded)", 60)}`);
+        return {
+          ok: false,
+          text: [
+            `prefix "${target}" matches ${matches.length} sessions — be more specific:`,
+            ...lines,
+          ].join("\n"),
+        };
+      }
+      fullId = matches[0].sessionId;
+    }
+    const jsonl = locateSessionJsonl(cwd, fullId);
+    if (!jsonl) {
+      return {
+        ok: false,
+        text: `no claude session ${fullId} under ${cwd}`,
+      };
+    }
+    const title = readFirstUserMessage(jsonl);
     return cmdLaunch({
       pluginConfig,
       cwd,
       task: extraPrompt,
       taskLabel: title,
-      resume: target,
+      resume: fullId,
+      notify,
     });
   }
 
@@ -552,6 +838,37 @@ export async function cmdResume({ pluginConfig = {}, args = "" } = {}) {
       "  /acc resume <…> <prompt>     same, plus inject a fresh prompt",
     ].join("\n"),
   };
+}
+
+// `/acc continue` — first-class peer of launch and resume. Picks the cwd's
+// newest jsonl (regardless of whether acc has retired it) and attaches a
+// fresh worker to it. Trailing prose is injected as a new prompt, just
+// like /acc resume.
+export async function cmdContinue({ pluginConfig = {}, args = "", notify = null } = {}) {
+  const ctx = buildCtx(pluginConfig);
+  const prior = loadState(ctx.stateDir);
+  const cwd =
+    prior.workerCwd ||
+    prior.lastCwd ||
+    pluginConfig.defaultCwd ||
+    process.cwd();
+  const extraPrompt = (args ?? "").trim();
+
+  const recent = listRecentSessions(cwd, { limit: 1 });
+  if (!recent.length) {
+    return {
+      ok: false,
+      text: `no claude sessions found under ${cwd} to continue`,
+    };
+  }
+  return cmdLaunch({
+    pluginConfig,
+    cwd,
+    task: extraPrompt,
+    taskLabel: recent[0].title,
+    resume: recent[0].sessionId,
+    notify,
+  });
 }
 
 function formatResumeListing(cwd) {

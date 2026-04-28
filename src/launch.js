@@ -77,6 +77,7 @@ export async function launchWorker({
   forkOnResume = false,
   awaitReady = true,
   readyTimeoutMs = 15_000,
+  extraEnv = null,           // {KEY: VAL, ...} prepended to the claude command line
 } = {}) {
   const trust = ensureProjectTrusted(cwd);
   const sessionId = forkOnResume ? randomUUID() : (resumeSessionId || randomUUID());
@@ -126,9 +127,18 @@ export async function launchWorker({
 
   // Pre-pend NO_PROXY for the claude command so the bundled MCP server
   // at http://127.0.0.1:7779/mcp isn't intercepted by the user's HTTP
-  // proxy. We OR with whatever no_proxy already is so we don't clobber
-  // existing settings.
+  // proxy. Caller-supplied extraEnv (e.g. lease-mode REMOTE_SSH_ALIAS_*)
+  // is also injected at the front so claude inherits the values via the
+  // shell — no need to teach tmux new-session about them.
+  const envParts = [];
+  if (extraEnv) {
+    for (const [k, v] of Object.entries(extraEnv)) {
+      if (v === null || v === undefined) continue;
+      envParts.push(`${k}=${shellSafe(String(v))}`);
+    }
+  }
   const parts = [
+    ...envParts,
     "NO_PROXY=\"${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1\"",
     "no_proxy=\"${no_proxy:+$no_proxy,}localhost,127.0.0.1\"",
     "claude", ...claudeArgs.map(shellSafe),

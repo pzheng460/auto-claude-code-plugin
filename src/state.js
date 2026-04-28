@@ -36,6 +36,13 @@ export const INITIAL_STATE = Object.freeze({
   stickyChannel: null,
   stickySender: null,
   stickyAccount: null,
+  // Pool-mode state — populated by /acc launch --pool / --plugin, cleared on
+  // release. Each lease record is the slice of the broker envelope we need
+  // long-term (id + alias + workdir + expiry); slot.env is reconstituted on
+  // demand instead of stored to keep the state file small.
+  leases: [],
+  leaseHeartbeatLastOkAt: null,
+  leaseHeartbeatFailCount: 0,
 });
 
 const LOCK_TIMEOUT_MS = 15_000;
@@ -110,6 +117,9 @@ const RETIRED_FIELDS = Object.freeze([
   "stickyChannel",
   "stickySender",
   "stickyAccount",
+  "leases",
+  "leaseHeartbeatLastOkAt",
+  "leaseHeartbeatFailCount",
 ]);
 
 function withClearedWorker(prev) {

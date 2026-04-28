@@ -8,7 +8,7 @@ import { sleep } from "./util.js";
 
 const execFile = promisify(execFileCb);
 
-export const DEFAULT_TMUX_NAME = "auto-claude-worker";
+export const DEFAULT_TMUX_NAME = "auto-claude-code";
 export const DEFAULT_TIMEOUT_MS = 5000;
 
 // Every recoverable tmux failure becomes a TmuxError with a stable `.kind` so

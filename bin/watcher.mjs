@@ -17,6 +17,7 @@ import {
   locateSessionJsonl,
   readTasks,
   summarizeRecentOutput,
+  findStopMarkerInEvents,
 } from "../src/claude-state.js";
 import {
   hasSession as tmuxHasSession,
@@ -29,6 +30,7 @@ import { removeCronJob } from "../src/cron.js";
 import { envNum, envBool } from "../src/env.js";
 import { sleep, oneLine } from "../src/util.js";
 import { formatAssistantText } from "../src/watcher-format.js";
+import { formatToolUse } from "../src/tool-format.js";
 import {
   startHookServer,
   queueForceContinue,
@@ -36,6 +38,8 @@ import {
   deliverAnswer,
 } from "../src/hook_server.js";
 import { autoAnswerInForceMode } from "../src/auto_answer.js";
+import { BrokerClient } from "../src/broker-client.js";
+import { heartbeatAll, releaseAll } from "../src/lease-manager.js";
 
 const execFile = promisify(execFileCb);
 
@@ -44,12 +48,41 @@ const BATCH_MS = envNum("AUTO_CLAUDE_CODE_WATCHER_BATCH_MS", 3000);
 // Force-continue: the watcher owns this since it's the only loop that sees
 // end_turn the moment it appears in jsonl. Tick is now a pure reporter.
 const FORCE_MODE = envBool("AUTO_CLAUDE_CODE_FORCE", false);
+// In summary mode the cron LLM digest is the chat-facing narrative, so
+// the watcher shouldn't double-push per-turn events. Critical events
+// (acc_ask_user, DONE/BLOCKED, circuit-breaker, retire) still go through
+// pushToChannel directly — only the live event stream is gated.
+const STREAM_LIVE_EVENTS = envBool("AUTO_CLAUDE_CODE_STREAM_LIVE_EVENTS", false);
 const MAX_CONTINUES = envNum("AUTO_CLAUDE_CODE_MAX_CONTINUES", 5);
+// JSONL fallback grace window: when the poll loop spots a fresh end_turn,
+// sleep this long before firing the tmux paste. Gives the Stop hook curl
+// (typically <50ms) time to land and bump lastPokedAtOffset. If the hook
+// is broken, the grace just delays the fallback by this much.
+const FALLBACK_GRACE_MS = envNum("AUTO_CLAUDE_CODE_FALLBACK_GRACE_MS", 300);
 // Per-event assistant text cap before `…`. Default generous so full replies
 // fit inside a single push; when a single event is larger than MSG_CHAR_LIMIT
 // the flusher splits it on paragraph/sentence boundaries instead of truncating.
 const TEXT_CHARS = envNum("AUTO_CLAUDE_CODE_WATCHER_TEXT_CHARS", 6000);
 const LIVENESS_EVERY_POLLS = 5;
+
+// Lease heartbeat: every N polls (POLL_MS=2s × 30 = 60s) ping the broker
+// for every active lease. Three consecutive failures → release + exit;
+// broker thinks we're dead anyway, hanging on locally risks duplicate
+// acquires on restart.
+const LEASE_HEARTBEAT_EVERY_POLLS = envNum("AUTO_CLAUDE_CODE_LEASE_HEARTBEAT_EVERY_POLLS", 30);
+const LEASE_HEARTBEAT_FAIL_LIMIT = envNum("AUTO_CLAUDE_CODE_LEASE_HEARTBEAT_FAIL_LIMIT", 3);
+let leaseHeartbeatFailCount = 0;
+let cachedLeaseBroker = null;
+
+function getLeaseBroker() {
+  if (cachedLeaseBroker) return cachedLeaseBroker;
+  const url =
+    process.env.AUTO_CLAUDE_CODE_BROKER_URL ||
+    "http://100.106.133.58:7778";
+  const token = process.env.AUTO_CLAUDE_CODE_BROKER_TOKEN || null;
+  cachedLeaseBroker = new BrokerClient({ baseUrl: url, token });
+  return cachedLeaseBroker;
+}
 
 const stateDir = resolveStateDir();
 const notifyChannel = process.env.AUTO_CLAUDE_CODE_NOTIFY_CHANNEL || "";
@@ -91,19 +124,11 @@ function formatEvent(ev) {
       // Preserve line breaks / code blocks for readability on the chat side.
       parts.push(`💬 ${formatAssistantText(block.text, TEXT_CHARS)}`);
     } else if (block.type === "tool_use") {
-      const name = block.name || "tool";
-      const input = block.input || {};
-      const arg =
-        input.file_path ||
-        input.notebook_path ||
-        input.command ||
-        input.pattern ||
-        input.url ||
-        input.query ||
-        input.description ||
-        "";
-      const shown = arg ? `(${oneLine(arg, 120)})` : "";
-      parts.push(`🔧 ${name}${shown}`);
+      // Formatter renders Edit/Write/MultiEdit/Bash as fenced diffs/code so
+      // the chat side actually sees the change Claude made, not just a
+      // path. Read-only tools (Read/Grep/Glob/…) stay one line.
+      const rendered = formatToolUse(block);
+      if (rendered) parts.push(rendered);
     }
   }
   return parts.length ? parts.join("\n") : null;
@@ -185,27 +210,8 @@ async function buildCompletionReport(mark, { state, jsonlPath }) {
       for (const l of recent.slice(-3)) lines.push(`  ${oneLine(l, 240)}`);
     }
   } catch {}
-  lines.push("", "cron removed · watcher still monitoring · /acc stop to release tmux");
+  lines.push("", "cron removed · watcher still monitoring · /acc exit to release tmux");
   return lines.join("\n");
-}
-
-function scanStopMarker(events) {
-  // Walk newest-first and only inspect the most recent assistant turn —
-  // matches detectStopMarker() in src/claude-state.js so both watcher and
-  // tick infer the same retire reason from the same jsonl tail.
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i];
-    if (ev?.type !== "assistant") continue;
-    for (const block of (ev.message?.content || [])) {
-      if (block?.type !== "text") continue;
-      for (const line of String(block.text ?? "").split(/\r?\n/)) {
-        const m = line.match(/^\s*(DONE|BLOCKED)\s*:/);
-        if (m) return { marker: m[1].toUpperCase(), line: line.trim() };
-      }
-    }
-    break;
-  }
-  return null;
 }
 
 async function pushToChannel(text) {
@@ -270,6 +276,16 @@ const hookServer = startHookServer({
       });
       queueForceContinue(prompt);
       saveState(stateDir, { autoContinueCount: count + 1 });
+      // Bump lastPokedAtOffset to current jsonl size so the JSONL-tail
+      // fallback can't double-poke for the same end_turn. This is the
+      // precise dedup — if the Stop hook ran for this turn, the fallback
+      // sees its work already covered. If the Stop hook is broken
+      // entirely (no fires), lastPokedAtOffset stays where it was and
+      // the fallback fires immediately, exactly as we want.
+      try {
+        const sz = statSync(jsonlPath).size;
+        if (sz > lastPokedAtOffset) lastPokedAtOffset = sz;
+      } catch {}
       log(`[stop hook] queued force-continue (count ${count + 1}/${MAX_CONTINUES})`);
       return { decision: "block", reason: "auto-continue queued by force mode" };
     },
@@ -478,6 +494,21 @@ async function shutdown(finalMsg, retireReason) {
   shuttingDown = true;
   try { await flushPending(); } catch {}
   if (finalMsg) { try { await pushToChannel(finalMsg); } catch {} }
+
+  // Release any held leases — best-effort; orphaned ones land in
+  // orphan_leases.json for cmdGc / next launch to retry.
+  try {
+    const fresh = loadState(stateDir);
+    const leases = Array.isArray(fresh.leases) ? fresh.leases : [];
+    if (leases.length > 0) {
+      const broker = getLeaseBroker();
+      await releaseAll({ broker, leases, stateDir });
+      log(`released ${leases.length} lease(s) on shutdown`);
+    }
+  } catch (err) {
+    log("lease release on shutdown failed:", err?.message || err);
+  }
+
   try {
     if (retireReason) {
       appendNudge(stateDir, {
@@ -512,18 +543,23 @@ async function loop() {
     offset = chunk.newOffset;
 
     if (chunk.events.length) {
-      for (const ev of chunk.events) {
-        const line = formatEvent(ev);
-        if (line) pending.push(line);
-      }
-      if (pending.length) {
-        // If the batched body would already exceed the per-message cap, flush
-        // right away instead of waiting for the BATCH_MS timer. This keeps
-        // single messages under feishu/telegram's size ceiling.
-        if (currentPendingBytes() >= FLUSH_SIZE_LIMIT) {
-          await flushPending();
-        } else {
-          scheduleFlush();
+      // Per-turn live event streaming. In summary mode this is off; the
+      // cron LLM summary is the digest. Format-cost is non-trivial at
+      // scale, so skip it entirely when nobody's reading.
+      if (STREAM_LIVE_EVENTS) {
+        for (const ev of chunk.events) {
+          const line = formatEvent(ev);
+          if (line) pending.push(line);
+        }
+        if (pending.length) {
+          // If the batched body would already exceed the per-message cap, flush
+          // right away instead of waiting for the BATCH_MS timer. This keeps
+          // single messages under feishu/telegram's size ceiling.
+          if (currentPendingBytes() >= FLUSH_SIZE_LIMIT) {
+            await flushPending();
+          } else {
+            scheduleFlush();
+          }
         }
       }
       // Reset dedupe if the user sent a new message/tool_result in this
@@ -531,8 +567,8 @@ async function loop() {
       // new completion worth reporting.
       if (chunk.events.some((e) => e?.type === "user")) completionReported = false;
 
-      const mark = scanStopMarker(chunk.events);
-      if (mark && !completionReported) {
+      const mark = findStopMarkerInEvents(chunk.events);
+      if (mark.marker && !completionReported) {
         // Push a proper completion report (not just the terse marker line)
         // and remove the cron so it stops spamming "no worker tracked"
         // summaries. Crucially, we do NOT retireWorker or exit here: Claude
@@ -552,17 +588,25 @@ async function loop() {
         completionReported = true;
       }
 
-      // Force-continue: if armed, the moment the latest event is an assistant
-      // end_turn / stop_sequence (and we haven't already poked for this same
-      // stop), fire the continue prompt. This is what replaces the tick's old
-      // cron-driven wake-up — no more minutes-long AWAITING windows.
+      // Force-continue fallback. Stop hook is the primary driver — when
+      // it fires it advances lastPokedAtOffset to the current jsonl size,
+      // so the `offset > lastPokedAtOffset` check below auto-skips ends
+      // already covered by the hook. We only fire here for end_turns the
+      // Stop hook silently dropped (plugin not loaded, port misroute).
       // Skip entirely when claude has just raised a DONE/BLOCKED marker —
       // the user said the task is finished; don't keep prodding.
-      if (FORCE_MODE && !mark && !completionReported) {
+      if (FORCE_MODE && !mark.marker && !completionReported) {
         const { awaitingReason, hadToolUse } = analyzeChunk(chunk.events);
         if (hadToolUse) toolUseSinceLastPoke = true;
         const freshEndTurn = awaitingReason && offset > lastPokedAtOffset;
-        if (freshEndTurn) {
+        // Race-protection: claude writes end_turn 1-10ms before Claude Code
+        // delivers the Stop hook (~10-50ms). If poll catches the end_turn
+        // first, sleep briefly so the in-flight hook can bump
+        // lastPokedAtOffset, then re-check before pasting. If hook fires
+        // during the grace window, the re-check skips the fallback. If
+        // hook is genuinely broken, lastPokedAtOffset stays put and we poke.
+        if (freshEndTurn) await sleep(FALLBACK_GRACE_MS);
+        if (freshEndTurn && offset > lastPokedAtOffset) {
           const nextCount = toolUseSinceLastPoke ? 1 : autoContinueCount + 1;
           if (nextCount > MAX_CONTINUES) {
             const reason = `${nextCount - 1} auto-continues without progress — circuit-breaker`;
@@ -610,6 +654,41 @@ async function loop() {
         await pushToChannel(`⚰️ ${reason}; watcher exiting`);
         await shutdown(null, reason);
         return;
+      }
+    }
+
+    // Heartbeat broker leases. Three consecutive failures → broker has
+    // already reaped us (TTL), and continuing to think we hold the slot
+    // would let us race an acquire of a slot somebody else now owns.
+    if (tickCount % LEASE_HEARTBEAT_EVERY_POLLS === 0) {
+      const fresh = loadState(stateDir);
+      const leases = Array.isArray(fresh.leases) ? fresh.leases : [];
+      if (leases.length > 0) {
+        const broker = getLeaseBroker();
+        try {
+          const r = await heartbeatAll({ broker, leases });
+          if (r.failed.length > 0 && r.ok.length === 0) {
+            // every heartbeat failed — count toward the strike-out
+            leaseHeartbeatFailCount++;
+            log(`lease heartbeat: all ${r.failed.length} failed (count=${leaseHeartbeatFailCount})`);
+          } else {
+            leaseHeartbeatFailCount = 0;
+            saveState(stateDir, {
+              leaseHeartbeatLastOkAt: new Date().toISOString(),
+              leaseHeartbeatFailCount: 0,
+            });
+          }
+        } catch (e) {
+          leaseHeartbeatFailCount++;
+          log(`lease heartbeat threw: ${e?.message || e}`);
+        }
+        if (leaseHeartbeatFailCount >= LEASE_HEARTBEAT_FAIL_LIMIT) {
+          const reason = `lease heartbeat failed ${leaseHeartbeatFailCount}× — broker has reaped us`;
+          await flushPending();
+          await pushToChannel(`⚰️ ${reason}; releasing leases & exiting`);
+          await shutdown(null, reason);
+          return;
+        }
       }
     }
     await sleep(POLL_MS);

@@ -7,7 +7,7 @@ while you check in from chat.
 
 One plugin, one worker. `openclaw` chat messages route `/acc …`
 (alias for `/auto-claude-code …`) to the plugin, which drives a single
-`auto-claude-worker` tmux session, watches its state, and streams new
+`auto-claude-code` tmux session, watches its state, and streams new
 output back to whatever channel you launched from (Feishu / Telegram /
 terminal).
 
@@ -46,16 +46,18 @@ Every command works as either `/acc <sub> …` in chat or
 
 | Subcommand | What it does |
 |---|---|
-| `launch "<task>"` | start a worker, install watchdog, begin streaming |
+| `launch "<task>"` | start a NEW worker on `<task>`, install watchdog, begin streaming |
+| `resume [n\|sid\|last]` | list recent sessions (no arg) or attach to a specific one |
+| `continue [prompt]` | attach to cwd's newest session, optionally with a fresh prompt |
 | `status` | tmux alive? task progress? heartbeat age? |
 | `attach` | print the `tmux attach` command |
-| `stop` | soft-exit the worker (Ctrl-C ladder), retire state, remove cron |
+| `exit` | soft-exit the worker (Ctrl-C ladder), retire state, remove cron · aliases: `stop`, `quit` |
 | `send <msg>` | paste a free-form message into the running REPL |
 | `form <csv>` | answer a multi-tab form in one shot (also auto-invoked when a chat reply looks like form answers) |
 
-`launch` flags: `--cwd <path>`, `--model <name>`, `--force`,
-`--instant` / `--summary`, `--resume <sessionId>`, `--continue`,
-`--max-continues <n>`, `--every <dur>`.
+`launch` flags (NEW worker only — session attachment lives on `resume`):
+`--cwd <path>`, `--model <name>`, `--force`, `--instant` / `--summary`,
+`--max-continues <n>`, `--every <dur>`, `--plugin <name>`, `--pool <ids>`.
 
 ### Answering Claude Code's multi-tab forms from chat
 
@@ -115,7 +117,7 @@ form itself via a one-shot `openclaw agent` call.
 - **`src/commands.js`** — `cmdLaunch`, `cmdStatus`, `cmdAttach`,
   `cmdStop`, `cmdSend`, `cmdForm`. Decides when to spawn a fresh
   watcher / install a cron / stream or batch.
-- **`src/launch.js`** — creates (or reuses) the `auto-claude-worker`
+- **`src/launch.js`** — creates (or reuses) the `auto-claude-code`
   tmux session, pre-accepts Claude Code's per-project trust prompt in
   `~/.claude.json`, runs `claude --dangerously-skip-permissions`, waits
   until a session jsonl appears.
@@ -182,7 +184,7 @@ optional.
 | `stateDir` | `~/.state/auto_claude_code` | State dir |
 | `defaultCwd` | `$HOME` | Fallback `cwd` when launch has none |
 | `defaultModel` | — | `--model` default |
-| `tmuxName` | `auto-claude-worker` | Shared tmux session name |
+| `tmuxName` | `auto-claude-code` | Shared tmux session name |
 | `force` | `false` | Default for `--force` |
 | `maxAutoContinues` | `5` | Force-mode circuit breaker |
 | `instant` | `true` | Stream vs. digest |
@@ -200,6 +202,25 @@ Env-var overrides for the watcher:
 - `AUTO_CLAUDE_CODE_MAX_CONTINUES`
 - `AUTO_CLAUDE_CODE_WATCHER_POLL_MS` (default `2000`)
 - `AUTO_CLAUDE_CODE_NOTIFY_CHANNEL` / `_TO` / `_ACCOUNT`
+- `AUTO_CLAUDE_CODE_TOOL_BODY_CHARS` (default `1500`) — per-tool-event body cap before truncation
+- `AUTO_CLAUDE_CODE_TOOL_BODY_LINES` (default `40`) — same, line cap
+
+### Per-tool rendering
+
+Each `tool_use` the worker emits is rendered as a chat-friendly block:
+
+| Tool | Output |
+|---|---|
+| `Edit`, `MultiEdit` | path + unified diff inside a ```diff fence (per-side budget) |
+| `Write` | path + full content inside a fenced block, language inferred from extension |
+| `Bash` | description + command inside a ```bash fence |
+| `NotebookEdit` | notebook path + cell + new source as a python-tagged fence |
+| `Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Task` | one-line summary |
+| `TodoWrite` / `TaskCreate` / `TaskUpdate` | bulleted task list with status icons |
+| anything else | one-line `🔧 Name(arg)` fallback |
+
+Bodies that exceed the body caps are clipped with a `# … +N more lines`
+marker rendered inside the fence so it stays attached to the block.
 
 ---
 
@@ -210,7 +231,7 @@ run **any shell command in its cwd without asking**. Scope each
 `launch` to a known-safe `cwd`; don't point it at your home directory
 unless you're OK with that blast radius.
 
-`/acc stop` sends Ctrl-C to the pane (up to 3×) before falling back to
+`/acc exit` sends Ctrl-C to the pane (up to 3×) before falling back to
 `tmux kill-session`. The Ctrl-C path lets Claude flush its session
 jsonl cleanly so you can `--resume` it later.
 

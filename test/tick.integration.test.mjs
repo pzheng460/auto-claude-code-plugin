@@ -11,7 +11,7 @@ import { ensureStateDir, saveState, loadState } from "../src/state.js";
 
 const tickScript = fileURLToPath(new URL("../bin/tick.mjs", import.meta.url));
 
-async function runTick(stateDir, { instant = false, extraEnv = {} } = {}) {
+async function runTick(stateDir, { extraEnv = {} } = {}) {
   const env = {
     ...process.env,
     AUTO_CLAUDE_CODE_STATE_DIR: stateDir,
@@ -19,7 +19,6 @@ async function runTick(stateDir, { instant = false, extraEnv = {} } = {}) {
     AUTO_CLAUDE_CODE_RECOVER_AFTER_SEC: "1800",
     ...extraEnv,
   };
-  if (instant) env.AUTO_CLAUDE_CODE_INSTANT = "1";
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [tickScript], {
       env,
@@ -42,20 +41,12 @@ async function runTick(stateDir, { instant = false, extraEnv = {} } = {}) {
 
 const freshStateDir = () => mkdtempSync(join(tmpdir(), "acc-tick-it-"));
 
-test("summary mode: no worker → branch=NONE + no-worker note", async () => {
+test("no worker → branch=NONE + no-worker note", async () => {
   const dir = freshStateDir();
   ensureStateDir(dir);
   const { code, stdout } = await runTick(dir);
   assert.equal(code, 0);
   assert.match(stdout, /branch=NONE/);
-  assert.match(stdout, /no worker is currently registered/);
-});
-
-test("instant mode: no worker → single no-worker line", async () => {
-  const dir = freshStateDir();
-  ensureStateDir(dir);
-  const { code, stdout } = await runTick(dir, { instant: true });
-  assert.equal(code, 0);
   assert.match(stdout, /no worker tracked/);
 });
 

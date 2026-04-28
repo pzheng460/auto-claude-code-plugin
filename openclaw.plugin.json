@@ -19,7 +19,7 @@
       },
       "tmuxName": {
         "type": "string",
-        "description": "Fixed tmux session name reused across launches. Default: auto-claude-worker"
+        "description": "Fixed tmux session name reused across launches. Default: auto-claude-code"
       },
       "force": {
         "type": "boolean",
@@ -61,6 +61,29 @@
           "to": { "type": "string" },
           "account": { "type": "string" }
         }
+      },
+      "broker": {
+        "type": "object",
+        "description": "harness-broker connection. Required only when /acc launch uses --plugin or --pool.",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Broker base URL (default: http://100.106.133.58:7778, jcl Tailscale)."
+          },
+          "token": {
+            "type": "string",
+            "description": "Bearer token for the broker. Optional today; required once broker enforces auth."
+          },
+          "owner": {
+            "type": "string",
+            "description": "Override the audit owner string sent on acquire. Defaults to chat:<senderId> or cli:<USER>."
+          }
+        }
+      },
+      "claudePluginsDir": {
+        "type": "string",
+        "description": "Where to look up <name>/.claude-plugin/harness.json for /acc launch --plugin. Default: ~/.claude/plugins"
       }
     }
   }

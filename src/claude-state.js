@@ -46,6 +46,7 @@ const WRAPPER_PREFIXES = [
   "<command-message>",
   "<local-command-stdout>",
   "<local-command-stderr>",
+  "<local-command-caveat>",
   "<system-reminder>",
   "Caveat:",
   "auto-claude-code watchdog:",
@@ -244,19 +245,15 @@ export async function inspectWorker({ workerSessionId, workerTmuxName, workerCwd
   };
 }
 
-// Scan the last few assistant text blocks for an explicit stop marker.
-// Returns { marker: "DONE"|"BLOCKED"|null, line: string|null }. Used by the
-// force-continue watchdog so claude can opt out of being re-nudged.
-export function detectStopMarker(jsonlPath) {
-  if (!jsonlPath) return { marker: null, line: null };
-  // Walk all tail-byte events newest-first; we break at the first assistant
-  // turn anyway, so the explicit slice cap was wasted work.
-  const events = readJsonlTail(jsonlPath, 0);
+// Scan an already-parsed event list newest-first for a DONE/BLOCKED marker
+// in the most recent assistant turn. Shared between the watcher (which has
+// per-chunk events in hand) and detectStopMarker (which reads jsonl).
+export function findStopMarkerInEvents(events) {
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i];
     if (ev?.type !== "assistant") continue;
     const content = ev.message?.content;
-    if (!Array.isArray(content)) continue;
+    if (!Array.isArray(content)) return { marker: null, line: null };
     for (const block of content) {
       if (block?.type !== "text") continue;
       const text = String(block.text ?? "");
@@ -268,6 +265,13 @@ export function detectStopMarker(jsonlPath) {
     break; // only inspect the most recent assistant turn
   }
   return { marker: null, line: null };
+}
+
+// Scan the tail of a session jsonl for DONE/BLOCKED in the most recent
+// assistant turn. Used by tick/plan to decide whether to retire the worker.
+export function detectStopMarker(jsonlPath) {
+  if (!jsonlPath) return { marker: null, line: null };
+  return findStopMarkerInEvents(readJsonlTail(jsonlPath, 0));
 }
 
 export function isAwaitingUserReply(jsonlPath) {

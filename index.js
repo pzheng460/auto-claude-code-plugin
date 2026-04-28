@@ -1,8 +1,12 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { cmdLaunch, cmdStop, cmdStatus, cmdAttach, cmdSend, cmdResume } from "./src/commands.js";
+import { cmdLaunch, cmdStop, cmdStatus, cmdAttach, cmdSend, cmdResume, cmdContinue } from "./src/commands.js";
 import { loadState, resolveStateDir } from "./src/state.js";
 
-const VALUE_FLAGS = new Set(["--cwd", "--model", "--every", "--interval", "--resume", "--max-continues"]);
+// --resume / --resume-last / --continue stay registered here so parseArgs
+// recognizes them as flags instead of folding them into `task`. The launch
+// case explicitly rejects them with a "use /acc resume instead" message —
+// these flags belong to /acc resume now, not /acc launch.
+const VALUE_FLAGS = new Set(["--cwd", "--model", "--every", "--interval", "--resume", "--max-continues", "--plugin", "--pool"]);
 const BOOL_FLAGS = new Set(["--kill-tmux", "--continue", "--fork", "--resume-last", "--force", "--instant", "--summary"]);
 
 function tokenize(raw) {
@@ -51,24 +55,21 @@ function usage() {
     "Usage:  /acc <sub>    (long alias: /auto-claude-code)",
     "",
     "Subcommands",
-    "  launch <task>       start / reuse a worker on <task>",
-    "  status              one-line health of the current worker",
-    "  attach              print the tmux attach command",
-    "  stop [--kill-tmux]  stop watcher/cron; tmux stays unless --kill-tmux",
-    "  send <text>         paste <text> into the running worker",
-    "  resume [n|sid|last] list recent sessions (no arg) or resume one",
-    "  help                show this help",
-    "  <prose>             implicit send — forwarded to the worker",
-    "  <n>|<n,n,…,submit>  reply to a Claude Code modal/form (auto-routed)",
+    "  launch <task>        start a NEW worker on <task>",
+    "  resume [n|sid|last]  list sessions (no arg) or resume a specific one",
+    "  continue [prompt]    attach to cwd's newest session (+ optional prompt)",
+    "  status               one-line health of the current worker",
+    "  attach               print the tmux attach command",
+    "  exit [--kill-tmux]   exit worker (aliases: stop|quit); tmux stays unless --kill-tmux",
+    "  send <text>          paste <text> into the running worker",
+    "  help                 show this help",
+    "  <prose>              implicit send — forwarded to the worker",
+    "  <n>|<n,n,…,submit>   reply to a Claude Code modal/form (auto-routed)",
     "",
-    "Launch flags",
+    "Launch flags  (only on /acc launch — session attachment lives on /acc resume)",
     "  --cwd <dir>            working directory (default: config or process cwd)",
     "  --model <id>           override claude model for this worker",
     "  --every <dur>          watchdog tick: 30s | 5m | 2h | raw cron  (default 5m)",
-    "  --resume <sid>         resume a specific claude session id",
-    "  --resume-last          resume the most recently auto-retired session",
-    "  --continue             claude --continue (most recent session in this cwd)",
-    "  --fork                 with --resume/--continue, fork into a new session id",
     "  --force                auto-poke claude when a turn ends mid-task",
     "  --max-continues N      circuit-breaker for --force  (default 5)",
     "  --instant              stream events live (default)",
@@ -79,10 +80,12 @@ function usage() {
     "  /acc resume                            # list recent sessions",
     "  /acc resume 2                          # resume the 2nd from the list",
     "  /acc resume last keep going on tests   # resume + inject a new prompt",
+    "  /acc continue                          # attach to cwd's newest session",
+    "  /acc continue keep going on the lint   # continue + inject a fresh prompt",
     "  /acc status",
     "  /acc 1                                 # answers a pending acc_ask_user question",
     "  /acc how is it going?                  # plain prose — sticky paste",
-    "  /acc stop",
+    "  /acc exit",
   ].join("\n");
 }
 
@@ -120,10 +123,26 @@ export default definePluginEntry({
 
         switch (sub) {
           case "launch": {
+            // Reject session-attaching flags — those belong to /acc resume.
+            // Carrying them through cmdLaunch was a historical wart that
+            // mixed "start new" and "attach existing" into one verb.
+            // --fork is rejected too because forking only makes sense as
+            // a modifier of resume/continue, both of which now live there.
+            if (options.resume || options["resume-last"] || options.continue || options.fork) {
+              return {
+                text: [
+                  "/acc launch is for starting a NEW worker on a new task.",
+                  "To attach to an existing session use:",
+                  "  /acc resume                — list recent sessions",
+                  "  /acc resume <n|sid|last>   — resume that session",
+                  "  /acc resume continue       — resume cwd's newest session",
+                  "  /acc continue              — alias for the line above",
+                ].join("\n"),
+              };
+            }
             const cwd = options.cwd || pluginConfig.defaultCwd || ctx.cwd || process.cwd();
             const model = options.model || pluginConfig.defaultModel;
             const notifyFromCtx = buildNotifyFromCtx(ctx);
-            const resume = options.resume || (options["resume-last"] ? "last" : null);
             const instantOpt = options.instant
               ? true
               : (options.summary ? false : undefined);
@@ -134,18 +153,17 @@ export default definePluginEntry({
               model,
               interval: options.every || options.interval,
               notify: notifyFromCtx,
-              resume,
-              continueLatest: !!options.continue,
-              fork: !!options.fork,
               // Pass through tri-state: only override config when the flag is
               // present. `!!options.force` would coerce "absent" to false and
               // shadow `pluginConfig.force = true` set in the openclaw config.
               force: options.force ? true : undefined,
               maxContinues: options["max-continues"] ? Number(options["max-continues"]) : undefined,
               instant: instantOpt,
+              plugin: options.plugin || null,
+              pool: options.pool || null,
             });
             const text = r.ok && pluginConfig.sticky !== false
-              ? `${r.text}\n💬 plain messages auto-forward to the worker  ·  /acc stop to release`
+              ? `${r.text}\n💬 plain messages auto-forward to the worker  ·  /acc exit to release`
               : r.text;
             return { text };
           }
@@ -157,6 +175,10 @@ export default definePluginEntry({
             const r = await cmdAttach({ pluginConfig });
             return { text: r.text };
           }
+          // Aligned with claude code `/exit` (alias `/quit`); legacy `stop`
+          // kept so existing scripts and muscle memory still work.
+          case "exit":
+          case "quit":
           case "stop": {
             const r = await cmdStop({ pluginConfig, killTmux: !!options["kill-tmux"] });
             if (typeof ctx.detachConversationBinding === "function") {
@@ -172,7 +194,18 @@ export default definePluginEntry({
             // /acc resume                — list recent sessions
             // /acc resume <n|sid|last>   — resume that session
             // Trailing prose is forwarded as a fresh prompt to inject.
-            const r = await cmdResume({ pluginConfig, args: subArgs });
+            // Pass `notify` through so the resumed worker registers sticky
+            // routing for THIS chat — without it, stickyChannel ends up
+            // null and plain replies stop reaching the worker.
+            const notifyFromCtx = buildNotifyFromCtx(ctx);
+            const r = await cmdResume({ pluginConfig, args: subArgs, notify: notifyFromCtx });
+            return { text: r.text };
+          }
+          case "continue": {
+            // First-class peer of launch and resume — attaches to cwd's
+            // newest jsonl. Trailing prose is injected as a fresh prompt.
+            const notifyFromCtx = buildNotifyFromCtx(ctx);
+            const r = await cmdContinue({ pluginConfig, args: subArgs, notify: notifyFromCtx });
             return { text: r.text };
           }
           case "help":
@@ -194,7 +227,7 @@ export default definePluginEntry({
     // Register both the long name and the short alias `/acc` with the same
     // handler so users can type whichever is faster.
     const cmdSpec = {
-      description: "Control an auto-claude-code tmux worker (launch|status|attach|resume|stop|send)",
+      description: "Control an auto-claude-code tmux worker (launch|status|attach|resume|exit|send)",
       acceptsArgs: true,
       handler,
     };
@@ -223,7 +256,13 @@ export default definePluginEntry({
       if (normStored && normStored !== normIncoming) return;
       if (event.isGroup) return; // never hijack group chats
       const content = (event.content || event.body || "").trim();
-      if (!content || content.startsWith("/")) return;
+      if (!content) return;
+      // Only let acc's own command surface escape sticky paste — every
+      // other `/...` (cc slash commands like /clear, /help, /compact,
+      // /exit, /resume, /model, …) gets pasted into the worker tmux,
+      // where the worker's real cc TUI handles it natively. This makes
+      // the post-launch chat feel identical to typing into cc directly.
+      if (/^\/(acc|auto-claude-code)(\s|$)/i.test(content)) return;
       const r = await cmdSend({ pluginConfig, message: content });
       if (!r.ok) return;
       return { handled: true };
@@ -245,32 +284,46 @@ export default definePluginEntry({
           .option("--model <id>", "Model override (default: config.defaultModel)")
           .option("--every <duration>", "Watchdog interval — '30s', '5m', '2h', or raw cron (default: 5m)")
           .option("--interval <expr>", "[deprecated] alias for --every")
-          .option("--resume <sid>", "Resume a specific claude session ID")
-          .option("--resume-last", "Resume the most recently auto-retired session")
-          .option("--continue", "Use claude --continue (most recent session in cwd)")
-          .option("--fork", "With --resume/--continue, fork into a new session ID")
           .option("--force", "Auto-nudge claude to keep working when it goes quiet mid-task")
           .option("--max-continues <n>", "Circuit-breaker limit for --force (default: 5)")
           .option("--instant", "Force instant streaming (default already on; overrides config)")
           .option("--summary", "Use the legacy cron+LLM-summary delivery instead of instant")
+          .option("--plugin <name>", "Claude Code plugin name; reads its harness.json to acquire pools")
+          .option("--pool <ids>", "Explicit pool list (comma-separated); used when --plugin is absent")
           .action(async (taskParts, opts) => {
             const pc = cfg();
             const cwd = opts.cwd || pc.defaultCwd || process.cwd();
-            const resume = opts.resume || (opts.resumeLast ? "last" : null);
             const r = await cmdLaunch({
               pluginConfig: pc,
               cwd,
               task: taskParts.join(" "),
               model: opts.model || pc.defaultModel,
               interval: opts.every || opts.interval,
-              resume,
-              continueLatest: !!opts.continue,
-              fork: !!opts.fork,
               // Tri-state — undefined means "fall through to pluginConfig.force".
               force: opts.force ? true : undefined,
               maxContinues: opts.maxContinues ? Number(opts.maxContinues) : undefined,
               instant: opts.instant ? true : (opts.summary ? false : undefined),
+              plugin: opts.plugin || null,
+              pool: opts.pool || null,
             });
+            console.log(r.text);
+            process.exitCode = r.ok ? 0 : 1;
+          });
+
+        group
+          .command("resume [target...]")
+          .description("List recent sessions, or resume one (n | sid | last)")
+          .action(async (targetParts) => {
+            const r = await cmdResume({ pluginConfig: cfg(), args: (targetParts || []).join(" ") });
+            console.log(r.text);
+            process.exitCode = r.ok ? 0 : 1;
+          });
+
+        group
+          .command("continue [prompt...]")
+          .description("Attach to cwd's newest session (peer of launch and resume)")
+          .action(async (promptParts) => {
+            const r = await cmdContinue({ pluginConfig: cfg(), args: (promptParts || []).join(" ") });
             console.log(r.text);
             process.exitCode = r.ok ? 0 : 1;
           });
