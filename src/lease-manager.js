@@ -139,7 +139,11 @@ export async function acquireGroup({ broker, requests, owner, purpose, ttlSec = 
 
 /**
  * Best-effort release of every lease in the array. Failures land in
- * orphan_leases.json for cmdGc / next-launch retry. Never throws.
+ * orphan_leases.json for retryOrphans / next-launch sweep. Never throws.
+ *
+ * Successfully-released ids are also dropped from orphan_leases.json so
+ * an entry that got persisted on a prior unreachable-broker release
+ * doesn't survive a later successful release of the same lease.
  */
 export async function releaseAll({ broker, leases, stateDir }) {
   const released = [];
@@ -157,7 +161,10 @@ export async function releaseAll({ broker, leases, stateDir }) {
       });
     }
   }
-  if (orphaned.length && stateDir) appendOrphans(stateDir, orphaned);
+  if (stateDir) {
+    if (released.length) dropOrphans(stateDir, released);
+    if (orphaned.length) appendOrphans(stateDir, orphaned);
+  }
   return { released, orphaned: orphaned.map((o) => o.leaseId) };
 }
 
@@ -223,8 +230,15 @@ export function appendOrphans(stateDir, entries) {
 }
 
 export function dropOrphan(stateDir, leaseId) {
+  dropOrphans(stateDir, [leaseId]);
+}
+
+export function dropOrphans(stateDir, leaseIds) {
+  if (!leaseIds?.length) return;
+  const drop = new Set(leaseIds);
   const cur = loadOrphans(stateDir);
-  const next = cur.filter((o) => o.leaseId !== leaseId);
+  const next = cur.filter((o) => !drop.has(o.leaseId));
+  if (next.length === cur.length) return;
   writeOrphansFile(stateDir, next);
 }
 

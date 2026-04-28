@@ -35,6 +35,7 @@ import {
   explicitPoolRequests,
   pluginManifestRequests,
   releaseAll,
+  retryOrphans,
 } from "./lease-manager.js";
 
 const DEFAULT_CRON_EXPR = "*/5 * * * *";
@@ -102,6 +103,18 @@ async function acquireLeasesIfRequested({
   const broker = makeBrokerClient(pluginConfig);
   if (!broker) {
     throw new Error("broker URL not configured (set pluginConfig.broker.url or AUTO_CLAUDE_CODE_BROKER_URL)");
+  }
+
+  // Sweep stale orphans first — entries that piled up from prior
+  // unreachable-broker shutdowns. Best-effort; remaining ones stay on
+  // disk for the next sweep.
+  try {
+    const swept = await retryOrphans({ broker, stateDir });
+    if (swept.retried > 0) {
+      log(`orphan sweep: released ${swept.released}/${swept.retried}, still pending ${swept.stillFailed}`);
+    }
+  } catch (err) {
+    log(`orphan sweep failed: ${err?.message || err}`);
   }
 
   // Pull / refresh the ssh bundle FIRST so the keys + config.d/harness exist
