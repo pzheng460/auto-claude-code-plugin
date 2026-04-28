@@ -32,17 +32,19 @@ openclaw cron watchdog ticks every 5 minutes, reads the worker's state
   without asking**. Only launch this on tasks scoped to a specific cwd.
 - The worker's cwd is fixed at launch time. It won't wander to other projects
   unless you explicitly tell it to.
-- You can attach to the tmux session at any time (`tmux attach -t auto-claude-<id>`)
+- You can attach to the tmux session at any time (`tmux attach -t auto-claude-code`)
   to watch, interrupt (Ctrl-c), or type into the conversation.
 
 ## Commands
 
 | | |
 |---|---|
-| `/auto-claude-code launch "<task>"` | Spawn a Claude Code worker in tmux, start watchdog |
+| `/auto-claude-code launch "<task>"` | Spawn a NEW worker on `<task>`, start watchdog |
+| `/auto-claude-code resume [n\|sid\|last]` | List recent sessions (no arg) or attach to a specific one |
+| `/auto-claude-code continue [prompt]` | Attach to cwd's newest session, optionally with a fresh prompt |
 | `/auto-claude-code status` | Tmux alive? Todos progress? Heartbeat age? |
 | `/auto-claude-code attach` | Print the `tmux attach` command |
-| `/auto-claude-code stop` | Remove watchdog cron; leave tmux alive (use `--kill-tmux` to also kill worker) |
+| `/auto-claude-code exit` | Remove watchdog cron; leave tmux alive (use `--kill-tmux` to also kill worker). Aliases: `stop`, `quit` |
 
 All commands also exist as `openclaw auto-claude-code <sub>` in the CLI.
 

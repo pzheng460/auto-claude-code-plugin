@@ -31,27 +31,47 @@ function shellSingleQuote(value) {
 }
 
 
-export function buildTickMessage({ stateDir, thresholds, instant = false }) {
-  // tick is a pure reporter now — it doesn't need AUTO_CLAUDE_CODE_FORCE or
-  // MAX_CONTINUES. The watcher owns force-continue and reads those directly
-  // from its own environment (set by spawnWatcher in commands.js).
+export function buildTickMessage({ stateDir, thresholds, force = false }) {
+  // tick.mjs needs AUTO_CLAUDE_CODE_FORCE so it can skip the heartbeat-stale
+  // NUDGE/RECOVER nudge — in force mode the watcher already drives every
+  // turn through Stop hook, so there's no real silence for tick to react to.
   const envs = [`AUTO_CLAUDE_CODE_STATE_DIR=${shellSingleQuote(stateDir)}`];
   if (thresholds?.nudgeAfterSec) envs.push(`AUTO_CLAUDE_CODE_NUDGE_AFTER_SEC=${thresholds.nudgeAfterSec}`);
   if (thresholds?.recoverAfterSec) envs.push(`AUTO_CLAUDE_CODE_RECOVER_AFTER_SEC=${thresholds.recoverAfterSec}`);
-  if (instant) envs.push(`AUTO_CLAUDE_CODE_INSTANT=1`);
+  if (force) envs.push(`AUTO_CLAUDE_CODE_FORCE=1`);
   const command = `${envs.join(" ")} node ${shellSingleQuote(TICK_SCRIPT)}`;
-  if (instant) {
+  if (force) {
+    // Force mode: watcher already drives the worker turn-by-turn, so the
+    // user only needs a narrative of what claude did this interval. Skip
+    // status/branch/heartbeat/progress/todos — they're noise when force
+    // is continuously prodding things forward.
     return [
-      "You are a deterministic trampoline. Do exactly one thing:",
+      "You are the auto-claude-code watchdog reporter (force mode).",
       "",
-      "Run this single bash command, and reply with its stdout VERBATIM:",
+      "Step 1 - Run this bash command and read its stdout:",
       `  ${command}`,
       "",
+      "The stdout has these tags; you only need <recent_activity> and <notes>:",
+      "  <recent_activity>  assistant text + tool calls since last tick",
+      "  <notes>            watchdog actions this tick",
+      "",
+      "Step 2 - Reply using this two-line skeleton (the second line is optional):",
+      "",
+      "  auto-claude-code heartbeat",
+      "  Recent actions: <2-5 sentences summarizing <recent_activity>. Mention concrete file edits, bash commands, and what claude said. Past tense.>",
+      "  Notes: <paraphrase <notes>>",
+      "",
+      "Substitution rules:",
+      "- If <recent_activity> is empty, the Recent-actions line is exactly: 'Recent actions: No new activity since last tick.'",
+      "- If <notes> is '(no watchdog actions this tick)', omit the Notes line entirely.",
+      "",
       "Rules:",
-      "- Do not summarize, reformat, re-order, or annotate.",
-      "- Do not add any commentary before or after.",
-      "- Preserve all whitespace and emoji from stdout.",
-      "- If the command fails, reply exactly: '❌ watchdog error — ' + the stderr first line.",
+      "- English only.",
+      "- Stick strictly to facts present in stdout. Do NOT invent files, commands, or todos.",
+      "- Do NOT include status, branch, progress, heartbeat-age, or todo lists; force mode makes them noise.",
+      "- If stdout starts with 'branch=NONE', reply only: 'auto-claude-code: no worker tracked'.",
+      "- Keep the reply under 400 words. No markdown headings, no code fences.",
+      "- If the bash command fails, reply: 'watchdog error: ' + the stderr first line.",
     ].join("\n");
   }
   return [
@@ -180,12 +200,12 @@ export async function isCronInstalled({ name = CRON_JOB_NAME } = {}) {
 // Callers that want fresh flags MUST explicitly remove the cron first
 // (cmdLaunch's supersede path already does this). New launches with no
 // prior worker fall through to the original behavior.
-export async function installCron({ cronExpr, stateDir, thresholds, notify, instant = false, timeoutSeconds = 60 }) {
+export async function installCron({ cronExpr, stateDir, thresholds, notify, force = false, timeoutSeconds = 60 }) {
   const existing = await findJobIdByName(CRON_JOB_NAME);
   if (existing.ok && existing.id) {
     return { ok: true, alreadyInstalled: true, id: existing.id };
   }
-  const message = buildTickMessage({ stateDir, thresholds, instant });
+  const message = buildTickMessage({ stateDir, thresholds, force });
   const args = [
     "cron", "add",
     "--name", CRON_JOB_NAME,

@@ -16,7 +16,7 @@ import { decideBranch, BRANCH } from "../src/decide.js";
 import { buildResumePrompt, pokeTmuxWorker } from "../src/poke.js";
 import { removeCronJob } from "../src/cron.js";
 import { planTick } from "../src/tick/plan.js";
-import { renderInstant, renderSummary, renderNoWorker } from "../src/tick/render.js";
+import { renderSummary, renderNoWorker } from "../src/tick/render.js";
 import { diffTodos } from "../src/tick/diff.js";
 import { envNum, envBool } from "../src/env.js";
 
@@ -26,16 +26,16 @@ import { envNum, envBool } from "../src/env.js";
 const config = {
   reportMaxEvents: envNum("AUTO_CLAUDE_CODE_REPORT_MAX_EVENTS", 30),
   reportTextChars: envNum("AUTO_CLAUDE_CODE_REPORT_TEXT_CHARS", 400),
-  instant: envBool("AUTO_CLAUDE_CODE_INSTANT"),
   nudgeAfterSec: envNum("AUTO_CLAUDE_CODE_NUDGE_AFTER_SEC", 600),
   recoverAfterSec: envNum("AUTO_CLAUDE_CODE_RECOVER_AFTER_SEC", 1800),
+  force: envBool("AUTO_CLAUDE_CODE_FORCE"),
 };
 
 const stateDir = resolveStateDir();
 const state = loadState(stateDir);
 
 if (!state.workerSessionId) {
-  process.stdout.write(renderNoWorker({ mode: config.instant ? "instant" : "summary" }));
+  process.stdout.write(renderNoWorker());
   process.exit(0);
 }
 
@@ -63,7 +63,10 @@ const plan = planTick({ branch, stopMarker });
 const notes = [];
 let sessionGoneReason = null;
 
-if (plan.shouldNudge) {
+// In force mode the watcher already drives end_turn -> continue in real
+// time via the Stop hook, so the cron-tick heartbeat-staleness nudge is
+// redundant noise. Skip it; tick stays a pure summary reporter.
+if (plan.shouldNudge && !config.force) {
   const tail = readJsonlTail(snapshot.jsonlPath, 5);
   const prompt = buildResumePrompt({
     ageSec: snapshot.ageSec,
@@ -91,7 +94,7 @@ if (stopMarker.marker) {
   notes.push(`claude raised ${stopMarker.marker} marker: ${stopMarker.line}`);
 }
 
-if (snapshot.awaitingUserReply) {
+if (snapshot.awaitingUserReply && !config.force) {
   notes.push("assistant ended its turn — watcher will force-continue if force mode is on");
 }
 
@@ -148,8 +151,8 @@ if (retireReason) {
 }
 
 // ---- report ---------------------------------------------------------------
-const payload = { branch: plan.branch, snapshot, state, diff, activity, notes };
-process.stdout.write(config.instant ? renderInstant(payload) : renderSummary(payload));
+const payload = { branch: plan.branch, snapshot, state, diff, activity, notes, force: config.force };
+process.stdout.write(renderSummary(payload));
 
 // ---- helpers --------------------------------------------------------------
 function summarizeTailEvents(entries) {

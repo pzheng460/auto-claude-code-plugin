@@ -18,11 +18,11 @@ test("instant mode: no cron (watcher streams chat and drives force)", () => {
 test("summary mode: install cron for LLM heartbeat", () => {
   assert.deepEqual(
     planCronInstall({ instant: false, notify: NOTIFY }),
-    { notify: NOTIFY, instant: false },
+    { notify: NOTIFY },
   );
 });
 
 test("summary mode without notify: still installs (cron has no other driver)", () => {
   const p = planCronInstall({ instant: false, notify: null });
-  assert.deepEqual(p, { notify: null, instant: false });
+  assert.deepEqual(p, { notify: null });
 });

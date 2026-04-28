@@ -59,7 +59,7 @@ const summarizeTask = (s) => oneLine(s, TASK_SUMMARY_CHARS);
 //   false    yes   | spawn (force only, no notify) install (announce)
 export function planCronInstall({ instant, notify }) {
   if (instant) return null;
-  return { notify: notify ?? null, instant: false };
+  return { notify: notify ?? null };
 }
 
 const WATCHER_SCRIPT = pathResolve(
