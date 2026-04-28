@@ -34,18 +34,22 @@ test("explicitPoolRequests splits comma list and derives sanitized aliases", () 
 test("buildLeaseEnv produces alias-suffixed env vars", () => {
   const leases = [
     { alias: "npu", pool: "npu-pool", leaseId: "L1",
-      hostAlias: "harness-ascend", host: "1.2.3.4", user: "root", workdir: "/w", port: null },
+      hostAlias: "harness-ascend", host: "1.2.3.4", user: "root", workdir: "/w", port: null,
+      keyPath: "~/.ssh/harness/npu.pem" },
     { alias: "gpu", pool: "gpu-pool", leaseId: "L2",
-      hostAlias: "harness-h100", host: "10.0.0.1", user: "u", workdir: "/g", port: 22 },
+      hostAlias: "harness-h100", host: "10.0.0.1", user: "u", workdir: "/g", port: 22,
+      keyPath: null },
   ];
   const env = buildLeaseEnv(leases);
   assert.equal(env.LEASE_IDS, "L1,L2");
   assert.equal(env.REMOTE_SSH_ALIAS_NPU, "harness-ascend");
   assert.equal(env.REMOTE_SSH_ALIAS_GPU, "harness-h100");
   assert.equal(env.REMOTE_HOST_NPU, "1.2.3.4");
+  assert.equal(env.REMOTE_KEY_PATH_NPU, "~/.ssh/harness/npu.pem");
   assert.equal(env.REMOTE_PORT_GPU, "22");
-  // null port shouldn't leak as the literal string "null"
   assert.equal(env.REMOTE_PORT_NPU, undefined);
+  assert.equal(env.REMOTE_KEY_PATH_GPU, undefined,
+    "null keyPath should NOT emit an env var");
 });
 
 // ---- orphan cleanup paths ----------------------------------------------

@@ -148,9 +148,10 @@ export async function acquireGroup({ broker, requests, owner, purpose, ttlSec = 
         leaseId: lease.lease_id,
         hostAlias: slot.host_alias || `harness-${slot.node_id}`,
         host: slot.host,
-        port: Number(slot.env?.REMOTE_PORT) || null,
+        port: Number(slot.port || slot.env?.REMOTE_PORT) || null,
         user: slot.user,
         workdir: slot.workdir,
+        keyPath: slot.env?.REMOTE_KEY_PATH || null,
         env: slot.env || {},
         expiresAt: lease.expires_at,
         startedAt: lease.started_at,
@@ -242,6 +243,7 @@ export function buildLeaseEnv(leases) {
     if (l.host) env[`REMOTE_HOST_${sfx}`] = l.host;
     if (l.port) env[`REMOTE_PORT_${sfx}`] = String(l.port);
     if (l.user) env[`REMOTE_USER_${sfx}`] = l.user;
+    if (l.keyPath) env[`REMOTE_KEY_PATH_${sfx}`] = l.keyPath;
   }
   return env;
 }
